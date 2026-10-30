@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
+import math
 import os
 import re
 import time
 
 from kubernetes import client, config
+from kubernetes.stream import stream
 
 from datetime import datetime, timezone
 
@@ -141,6 +144,86 @@ def safe_filename(name):
     Replace characters unsafe for Pod or container filenames.
     """
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
+
+def _kube_log_time(line):
+    """Parse the timestamp prefix added by Kubernetes (up to nanoseconds)."""
+    token = line.partition(" ")[0]
+    token = re.sub(r"(\.\d{6})\d+(?=Z$|[+-]\d\d:\d\d$)", r"\1", token)
+    try:
+        return datetime.fromisoformat(token.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def collect_proxy_logs(start_timestamp, end_timestamp, output_dir):
+    """Collect fault-proxy stdout and its structured fire log for one window.
+
+    The proxy writes fault hits to an emptyDir file, not stdout.  Fetch that
+    file while the Pod still exists; Kubernetes container logs alone omit it.
+    """
+    config.load_kube_config()
+    v1 = client.CoreV1Api()
+    os.makedirs(output_dir, exist_ok=True)
+    pods = v1.list_namespaced_pod(namespace="chaos", label_selector="app=fault-proxy").items
+    if not pods:
+        print("[proxy logs] no app=fault-proxy Pod found in namespace chaos")
+        return
+
+    since_seconds = max(1, math.ceil(time.time() - start_timestamp))
+    for pod in pods:
+        pod_name = pod.metadata.name
+        container_names = {c.name for c in pod.spec.containers}
+        statuses = (getattr(pod.status, "container_statuses", None) or []) if pod.status else []
+        restart_counts = {s.name: s.restart_count for s in statuses}
+        for container_name in sorted(container_names):
+            for previous in (False, True):
+                if previous and restart_counts.get(container_name, 0) < 1:
+                    continue
+                suffix = "_previous" if previous else ""
+                filename = f"{safe_filename(pod_name)}_{safe_filename(container_name)}{suffix}.log"
+                try:
+                    raw = v1.read_namespaced_pod_log(
+                        name=pod_name, namespace="chaos", container=container_name,
+                        timestamps=True, since_seconds=since_seconds, previous=previous,
+                    )
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as out:
+                        for line in raw.splitlines():
+                            ts = _kube_log_time(line)
+                            if ts is not None and start_timestamp <= ts <= end_timestamp:
+                                out.write(line + "\n")
+                    print(f"[proxy logs] collected chaos/{pod_name}/{container_name}{suffix}")
+                except Exception as exc:  # Keep collecting other proxy log sources.
+                    print(f"[proxy logs] failed chaos/{pod_name}/{container_name}{suffix}: {exc}")
+
+        # Fault hits are written by engine.py to the Deployment's --log path.
+        # Use Pod exec before the emptyDir is removed; filter by the JSONL `t` field.
+        try:
+            raw = stream(
+                v1.connect_get_namespaced_pod_exec, pod_name, "chaos",
+                container="fault-proxy",
+                command=["cat", "/var/log/fault-proxy/fires.jsonl"],
+                stderr=False, stdin=False, stdout=True, tty=False,
+            )
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            filename = f"{safe_filename(pod_name)}_fires.jsonl"
+            hits = 0
+            with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as out:
+                for line in raw.splitlines():
+                    try:
+                        entry = json.loads(line)
+                        ts = float(entry["t"])
+                    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                        continue
+                    if start_timestamp <= ts <= end_timestamp:
+                        out.write(line + "\n")
+                        hits += 1
+            print(f"[proxy logs] collected {hits} fault hits from chaos/{pod_name}")
+        except Exception as exc:  # Exec transports may raise websocket errors.
+            print(f"[proxy logs] failed to read fires.jsonl from chaos/{pod_name}: {exc}")
 
 
 def main():

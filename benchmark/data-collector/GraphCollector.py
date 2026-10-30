@@ -5,6 +5,8 @@ import os
 import pymysql
 import requests
 from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from collections import Counter
 
@@ -525,20 +527,30 @@ def download_file(file_path, save_path, status):
 TASK_TIME_KEYS = ['create_time', 'start_time', 'gmt_create', 'begin_time', 'update_time', 'end_time']
 
 
+def _db_timezone():
+    """Timezone used by MySQL DATETIME fields, which carry no timezone info.
+
+    distributed_real writes gmt_create from containers running in UTC. Override
+    this when collecting data from a deployment that writes local wall time.
+    """
+    return ZoneInfo(os.getenv('GRAPH_TASK_TIMEZONE', 'UTC'))
+
+
 def _task_epoch(task):
     """Parse an epoch-second timestamp from a task row, or return None."""
-    import datetime
     for k in TASK_TIME_KEYS:
         v = task.get(k)
         if v is None:
             continue
-        if isinstance(v, datetime.datetime):
-            return v.timestamp()
+        if isinstance(v, datetime):
+            dt = v
+            return dt.replace(tzinfo=_db_timezone()).timestamp() if dt.tzinfo is None else dt.timestamp()
         if isinstance(v, (int, float)):
             # Normalize millisecond timestamps to seconds.
             return float(v) / (1000.0 if v > 1e12 else 1.0)
         try:
-            return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%d %H:%M:%S"))
+            dt = datetime.fromisoformat(str(v).strip().replace('Z', '+00:00'))
+            return dt.replace(tzinfo=_db_timezone()).timestamp() if dt.tzinfo is None else dt.timestamp()
         except Exception:
             continue
     return None
@@ -555,7 +567,25 @@ def fetch_tasks_in_window(config):
     cursor.execute("SELECT * FROM sys_task")
     tasks = cursor.fetchall()
 
-    graph_ids = {t['graph_id'] for t in tasks if t.get('graph_id') is not None}
+    start = getattr(config, 'start', None)
+    end = getattr(config, 'end', None)
+    task_epochs = [(task, _task_epoch(task)) for task in tasks]
+    has_time = any(epoch is not None for _, epoch in task_epochs)
+
+    if has_time and start is not None and end is not None:
+        selected = [task for task, epoch in task_epochs
+                    if epoch is not None and start <= epoch <= end]
+        print(f"Selected {len(selected)} / {len(tasks)} tasks in window [{start}, {end}]")
+        if not selected:
+            recent = max((epoch for _, epoch in task_epochs if epoch is not None), default=None)
+            if recent is not None:
+                print(f"Latest task epoch: {recent:.0f}; DB DATETIME timezone: "
+                      f"{os.getenv('GRAPH_TASK_TIMEZONE', 'UTC')}")
+    else:
+        selected = tasks
+        print(f"No task time column or window found; processing all {len(selected)} tasks")
+
+    graph_ids = {t['graph_id'] for t in selected if t.get('graph_id') is not None}
     graph_path_map = {}
     if graph_ids:
         cursor.execute(
@@ -566,18 +596,6 @@ def fetch_tasks_in_window(config):
 
     cursor.close()
     conn.close()
-
-    start = getattr(config, 'start', None)
-    end = getattr(config, 'end', None)
-    has_time = any(_task_epoch(t) is not None for t in tasks)
-
-    if has_time and start is not None and end is not None:
-        selected = [t for t in tasks
-                    if (_task_epoch(t) is not None and start <= _task_epoch(t) <= end)]
-        print(f"Selected {len(selected)} / {len(tasks)} tasks in window [{start}, {end}]")
-    else:
-        selected = tasks
-        print(f"No task time column or window found; processing all {len(selected)} tasks")
 
     return [(t, graph_path_map.get(t.get('graph_id'))) for t in selected]
 
@@ -604,20 +622,46 @@ def fetch_graph_json(file_path, save_path, retries=3):
     return None
 
 
-def parse_call_chain(graph):
-    """Build an ordered call chain from graph.json level_details.level_routes.
+SPAN_FIELDS = ('status', 'type', 'role', 'executor', 'error', 'degrade_stage',
+               'zone_pref', 'token', 'cost', 'time')
+ATTEMPT_FIELDS = ('status', 'executor', 'error', 'degrade_stage', 'zone_pref',
+                  'token', 'cost', 'time')
 
-    level_routes maps each caller to its callees at each level.
-    Increasing level order yields planner -> intermediate tools -> summarizer.
+
+def _span_summary(span):
+    """Keep execution metadata and ordered retries without large message bodies."""
+    summary = {key: span[key] for key in SPAN_FIELDS if key in span}
+    attempts = span.get('attempts') or []
+    summary['attempt_count'] = len(attempts)
+    summary['attempts'] = [
+        {'attempt': index, **{key: item[key] for key in ATTEMPT_FIELDS if key in item}}
+        for index, item in enumerate(attempts, start=1)
+    ]
+    return summary
+
+
+def parse_call_chain(graph):
+    """Build an ordered call chain with caller spans and retry history.
+
+    level_routes maps each caller to its callees at each level. level_spans
+    records the logical vertex; a caller span also identifies the real executor
+    used by a fallback. Increasing level order yields the execution sequence.
     """
     details = sorted(graph.get('level_details', []) or [], key=lambda d: d.get('level', 0))
 
     levels = []
     edges = []
+    caller_spans = []
     for lvl in details:
         level_no = lvl.get('level')
         routes = lvl.get('level_routes', {}) or {}
-        vertexes = lvl.get('level_vertexes', []) or list(routes.keys())
+        source_spans = lvl.get('level_spans', {}) or {}
+        vertexes = list(dict.fromkeys((lvl.get('level_vertexes') or []) +
+                                     list(routes) + list(source_spans)))
+        spans = {vertex: _span_summary(span) for vertex, span in source_spans.items()}
+        for vertex, span in spans.items():
+            if span.get('role') == 'caller':
+                caller_spans.append({'level': level_no, 'vertex': vertex, **span})
         level_edges = []
         for caller, callees in routes.items():
             if not callees:
@@ -625,7 +669,8 @@ def parse_call_chain(graph):
             for callee in callees.keys():
                 level_edges.append({'source': caller, 'destination': callee})
                 edges.append({'level': level_no, 'source': caller, 'destination': callee})
-        levels.append({'level': level_no, 'vertexes': vertexes, 'edges': level_edges})
+        levels.append({'level': level_no, 'vertexes': vertexes,
+                       'edges': level_edges, 'spans': spans})
 
     # Record each vertex at its first level to form the ordered path.
     seen = set()
@@ -650,6 +695,7 @@ def parse_call_chain(graph):
         'chain_length': len(path),
         'levels': levels,          # Vertices and edges by level.
         'edges': edges,            # Flattened edges with level.
+        'caller_spans': caller_spans,
     }
 
 

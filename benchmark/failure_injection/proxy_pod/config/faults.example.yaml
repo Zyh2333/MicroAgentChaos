@@ -1,0 +1,217 @@
+#
+#
+#   python -m proxy_pod.server --config config/faults.example.yaml
+#   curl -XPOST --data-binary @config/faults.example.yaml \
+#        http://<proxy>:8900/__fault__/rules
+
+proxy:
+  listen: "0.0.0.0:8900"
+  upstreams:
+    # llm: "https://api.openai.com"
+    deepseek: "https://api.deepseek.com"
+    qwen: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode"
+    tool: "http://tool-service.default.svc.cluster.local:8080"
+  default_upstream: "qwen"
+  routes:
+    - { path_prefix: "/v1", upstream: "qwen" }
+    - { path_prefix: "/tools", upstream: "tool" }
+  force_non_stream: true
+
+faults:
+
+  - id: f1_pod_crash_503
+    category: F1
+    description: "上游实例崩溃/不可用(503), 服务级持续故障, 需重启恢复"
+    scope: service
+    persistence: persistent
+    propagation: downstream
+    recovery: restart
+    match: { upstream: "llm", methods: ["POST"] }
+    stage: request
+    action: abort
+    status: 503
+    body: { error: { type: "service_unavailable", message: "upstream pod crashed" } }
+
+  - id: f1_resource_exhaustion_slow
+    category: F1
+    description: "资源耗尽导致处理变慢(持续注入 8s 延迟)"
+    scope: service
+    persistence: persistent
+    propagation: downstream
+    recovery: auto
+    match: { upstream: "llm" }
+    stage: request
+    action: delay
+    value: 8000
+
+  - id: f1_network_unreachable
+    category: F1
+    description: "网络不可达: 连接被丢弃/超时(间歇 30%)"
+    scope: call
+    persistence: intermittent
+    propagation: local
+    recovery: retry
+    match: { upstream: "tool" }
+    stage: request
+    action: drop
+
+
+  - id: f2_auth_fail_call
+    category: F2
+    description: "单次调用携带错误凭据 -> 401(调用级)"
+    scope: call
+    persistence: single
+    propagation: local
+    recovery: retry
+    match:
+      upstream: "llm"
+      header_equals: { "X-Fault-Inject": "bad_cred" }
+    stage: request
+    action: abort
+    status: 401
+    body: { error: { type: "invalid_api_key", message: "incorrect api key provided" } }
+
+  - id: f2_auth_fail_service
+    category: F2
+    description: "某服务配置的 API Key 过期 -> 该服务全部调用 401(服务级持续)"
+    scope: service
+    persistence: persistent
+    propagation: cross_task
+    recovery: config
+    match:
+      upstream: "llm"
+      header_equals: { "X-Service": "report-agent" }
+    stage: request
+    action: abort
+    status: 401
+    body: { error: { type: "expired_api_key", message: "api key expired for this service" } }
+
+  - id: f2_auth_fail_cross_service
+    category: F2
+    description: "多服务共享的 API Key 过期 -> 命中该上游全部调用(跨服务级联)"
+    scope: cross_service
+    persistence: persistent
+    propagation: cross_service
+    recovery: config
+    match: { upstream: "llm" }
+    stage: request
+    action: abort
+    status: 401
+    body: { error: { type: "expired_api_key", message: "shared api key expired" } }
+    enabled: false  # Enable separately from the rules above.
+
+  - id: f2_quota_exhausted_429
+    category: F2
+    description: "配额/额度耗尽 -> 429(突发 3 次后恢复)"
+    scope: cross_service
+    persistence: burst
+    propagation: cross_service
+    recovery: auto
+    match: { upstream: "llm" }
+    stage: request
+    action: abort
+    status: 429
+    body: { error: { type: "insufficient_quota", message: "you exceeded your current quota" } }
+
+  - id: f2_model_mapping_error
+    category: F2
+    description: "模型与 base_url 映射错误: 把请求模型改成未授权模型 -> 下游 403/404"
+    scope: service
+    persistence: persistent
+    propagation: downstream
+    recovery: config
+    match: { upstream: "llm", path_prefix: "/v1/chat/completions" }
+    stage: request
+    action: set_json
+    target_path: "$.model"
+    value: "restricted-model-no-access-9527"
+
+
+  - id: f3_missing_required_param
+    category: F3
+    description: "删除下游工具调用的必填参数 -> 参数契约错误"
+    scope: call
+    persistence: intermittent
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "tool", path_prefix: "/tools" }
+    stage: request
+    action: remove_json
+    target_path: "$.arguments.query"
+
+  - id: f3_response_schema_mismatch
+    category: F3
+    description: "篡改响应 schema: 把结果字段设为错误类型 -> 调用方解析失败"
+    scope: call
+    persistence: single
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "tool" }
+    stage: response
+    action: set_json
+    target_path: "$.result"
+    value: null
+
+  - id: f3_response_corrupt
+    category: F3
+    description: "响应体编码损坏(mojibake), 模拟跨服务字符集不一致"
+    scope: call
+    persistence: intermittent
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "llm", path_prefix: "/v1/chat/completions" }
+    stage: response
+    action: corrupt
+    target_path: "$.choices[0].message.content"
+    value: "mojibake"
+
+  - id: f3_message_lost
+    category: F3
+    description: "服务间消息丢失: 响应被丢弃(超时)"
+    scope: call
+    persistence: intermittent
+    propagation: cross_task
+    recovery: retry
+    match: { upstream: "tool" }
+    stage: response
+    action: drop
+
+
+  - id: f4_tool_calls_stripped
+    category: F4
+    description: "清空 LLM 返回的 tool_calls -> 工具从不被调用(执行流程断裂)"
+    scope: task
+    persistence: single
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "llm", path_prefix: "/v1/chat/completions" }
+    stage: response
+    action: set_json
+    target_path: "$.choices[0].message.tool_calls"
+    value: []
+
+  - id: f4_repeated_execution
+    category: F4
+    description: "重放上一次 LLM 响应 -> 步骤重复执行(第 2 次起生效)"
+    scope: task
+    persistence: persistent
+    propagation: cross_task
+    recovery: restart
+    min_count: 1
+    match: { upstream: "llm", path_prefix: "/v1/chat/completions" }
+    stage: response
+    action: duplicate
+
+  - id: f4_premature_truncation
+    category: F4
+    description: "截断 LLM 输出至 30% -> 结果不完整/提前终止"
+    scope: call
+    persistence: single
+    propagation: local
+    recovery: retry
+    match: { upstream: "llm", path_prefix: "/v1/chat/completions" }
+    stage: response
+    action: truncate
+    target_path: "$.choices[0].message.content"
+    value: 0.3
+    enabled: false  # Disabled by default for isolated tests.

@@ -99,6 +99,13 @@ if __name__ == "__main__":
 
     def collect_for_config(config, namespaces):
         """Collect metrics for the complete window in config."""
+        # Proxy fault records live in chaos/emptyDir, outside agent-network stdout.
+        try:
+            LogCollector.collect_proxy_logs(
+                config.start, config.end,
+                os.path.join('./data', str(config.user), 'chaos', 'log'))
+        except Exception as e:
+            print(f"Failed to collect fault-proxy logs: {e}")
         for n in namespaces:
             config.namespace = n
             config.svcs.clear()
@@ -150,12 +157,10 @@ if __name__ == "__main__":
             if kept:
                 print(f"[{n}] {kept} pre-fault logs from disappeared pods merged into log/ (suffix: _log_prefault)")
 
-    # ------------------------------------------------------------------
     # chaos_service.sh uses this mode before deleting the deployment.
     # --user, --start, and --end identify the output directory and full window.
     #   python Main.py --user <dir> --start <epoch> --end <epoch>
     # Without these options, process the label_files list below.
-    # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(description='Collect all metrics in the specified time window')
     parser.add_argument('--user', help='Output directory (config.user), relative to ./data')
     parser.add_argument('--start', type=int, help='Window start time (epoch seconds)')
@@ -179,6 +184,12 @@ if __name__ == "__main__":
         if cli_args.logs_only:
             print(f"==> Collecting logs for one window [{config.start} ~ {config.end}] "
                   f"-> data/{config.user}/<ns>/{cli_args.log_subdir}")
+            try:
+                LogCollector.collect_proxy_logs(
+                    config.start, config.end,
+                    os.path.join('./data', str(config.user), 'chaos', cli_args.log_subdir))
+            except Exception as e:
+                print(f"Failed to collect fault-proxy logs: {e}")
             for n in namespaces:
                 config.namespace = n
                 data_folder = './data/' + str(config.user) + '/' + n

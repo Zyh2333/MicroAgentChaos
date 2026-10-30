@@ -1,0 +1,848 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-research
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-research
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-research
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-research
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-research
+          image: 47.121.177.73:81/agent/agent-network-marble-research:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10202
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10202"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-research
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-research
+  ports:
+    - name: http
+      port: 10202
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-web
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-web
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-web
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-web
+          image: 47.121.177.73:81/agent/agent-network-marble-web:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10201
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10201"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-web
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-web
+  ports:
+    - name: http
+      port: 10201
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-coding
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-coding
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-coding
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-coding
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-coding
+          image: 47.121.177.73:81/agent/agent-network-marble-coding:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10203
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10203"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-coding
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-coding
+  ports:
+    - name: http
+      port: 10203
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-database
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-database
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-database
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-database
+          image: 47.121.177.73:81/agent/agent-network-marble-database:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10204
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10204"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-database
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-database
+  ports:
+    - name: http
+      port: 10204
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-world
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-world
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-world
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-world
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-world
+          image: 47.121.177.73:81/agent/agent-network-marble-world:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10205
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10205"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-world
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-world
+  ports:
+    - name: http
+      port: 10205
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-werewolf
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-werewolf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-werewolf
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-werewolf
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-werewolf
+          image: 47.121.177.73:81/agent/agent-network-marble-werewolf:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10207
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10207"
+            - name: SERVICE_THREADS
+              value: "8"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-werewolf
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-werewolf
+  ports:
+    - name: http
+      port: 10207
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-network-marble-minecraft
+  namespace: agent-network
+  labels:
+    app: agent-network-marble-minecraft
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-network-marble-minecraft
+  template:
+    metadata:
+      labels:
+        app: agent-network-marble-minecraft
+    spec:
+      imagePullSecrets:
+        - name: private-registry-secret
+      containers:
+        - name: agent-network-marble-minecraft
+          image: 47.121.177.73:81/agent/agent-network-marble-minecraft:py310-microagentchaos
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 10206
+          env:
+            - name: PROXY_IP
+              value: fault-proxy.chaos.svc.cluster.local
+            - name: PROXY_PORT
+              value: "18800"
+            - name: DEEPSEEK_API_KEY
+              value: $DEEPSEEK_API_KEY$
+            - name: SERVICE_PORT
+              value: "10206"
+            - name: SERVICE_THREADS
+              value: "3"
+            - name: MINECRAFT_AUTOSTART
+              value: "1"
+            - name: MINECRAFT_CONTROLLER_CWD
+              value: "controller"
+            - name: MINECRAFT_CONTROLLER_URL
+              value: "http://127.0.0.1:5001"
+            - name: MINECRAFT_STARTUP_TIMEOUT
+              value: "120"
+            - name: MINECRAFT_CONTROLLER_CMD
+              value: "python minecraft_server.py -H 192.168.31.15 -P 25565 -LP 5001 -U player1 -W world"
+            - name: OPENAI_API_KEY
+              value: $OPENAI_API_KEY$
+
+            - name: OPENAI_API_BASE_ROUTE_KEY
+              value: $OPENAI_API_KEY$
+            - name: OPENAI_API_BASE_ROUTE_MODEL
+              value: qwen3.5-flash
+            - name: OPENAI_API_BASE_ROUTE
+              value: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+            - name: OPENAI_MODEL
+              value: qwen3.5-flash
+
+            - name: MINIO_ACCESS_KEY
+              value: AKIAIOSFODNN7EXAMPLE
+
+            - name: MINIO_SECRET_KEY
+              value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+            - name: STORAGE_DOMAIN
+              value: minio.agent.network.com:12104
+
+            - name: CENTER_ADDR
+              value: http://$HOST_IP$:8848
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-marble-minecraft
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-marble-minecraft
+  ports:
+    - name: http
+      port: 10206
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: agent-network-planner
+  name: agent-network-planner
+  namespace: agent-network
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: agent-network-planner
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: agent-network-planner
+    spec:
+      containers:
+      - env:
+        - name: PROXY_IP
+          value: fault-proxy.chaos.svc.cluster.local
+        - name: PROXY_PORT
+          value: "18800"
+        - name: DEEPSEEK_API_KEY
+          value: $DEEPSEEK_API_KEY$
+        - name: OPENAI_API_KEY
+          value: $OPENAI_API_KEY$
+        - name: OPENAI_MODEL
+          value: qwen3.5-plus
+        - name: OPENAI_API_BASE_ROUTE_KEY
+          value: $OPENAI_API_KEY$
+        - name: OPENAI_API_BASE_ROUTE_MODEL
+          value: qwen3.5-flash
+        - name: OPENAI_API_BASE_ROUTE
+          value: https://dashscope.aliyuncs.com/compatible-mode/v1
+        - name: MINIO_ACCESS_KEY
+          value: AKIAIOSFODNN7EXAMPLE
+        - name: MINIO_SECRET_KEY
+          value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        - name: STORAGE_DOMAIN
+          value: minio.agent.network.com:12104
+        - name: CENTER_ADDR
+          value: http://$HOST_IP$:8848
+        image: 47.121.177.73:81/agent/agent-network-planner:py310-microagentchaos
+        imagePullPolicy: Always
+        name: agent-network-planner
+        ports:
+        - containerPort: 18082
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        terminationMessagePath: "/dev/termination-log"
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      imagePullSecrets:
+      - name: private-registry-secret
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-planner
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-planner
+  ports:
+    - name: http
+      port: 18082
+      targetPort: 18082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: agent-network-summarizer
+  name: agent-network-summarizer
+  namespace: agent-network
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: agent-network-summarizer
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: agent-network-summarizer
+    spec:
+      containers:
+      - env:
+        - name: PROXY_IP
+          value: fault-proxy.chaos.svc.cluster.local
+        - name: PROXY_PORT
+          value: "18800"
+        - name: DEEPSEEK_API_KEY
+          value: $DEEPSEEK_API_KEY$
+        - name: OPENAI_API_KEY
+          value: $OPENAI_API_KEY$
+        - name: OPENAI_MODEL
+          value: qwen-long
+        - name: OPENAI_API_BASE_ROUTE_KEY
+          value: $OPENAI_API_KEY$
+        - name: OPENAI_API_BASE_ROUTE_MODEL
+          value: qwen3.5-flash
+        - name: OPENAI_API_BASE_ROUTE
+          value: https://dashscope.aliyuncs.com/compatible-mode/v1
+        - name: MINIO_ACCESS_KEY
+          value: AKIAIOSFODNN7EXAMPLE
+        - name: MINIO_SECRET_KEY
+          value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+        - name: STORAGE_DOMAIN
+          value: minio.agent.network.com:12104
+        - name: CENTER_ADDR
+          value: http://$HOST_IP$:8848
+        image: 47.121.177.73:81/agent/agent-network-summarizer:py310-microagentchaos
+        imagePullPolicy: Always
+        name: agent-network-summarizer
+        ports:
+        - containerPort: 18081
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        terminationMessagePath: "/dev/termination-log"
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      imagePullSecrets:
+      - name: private-registry-secret
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-summarizer
+  namespace: agent-network
+spec:
+  selector:
+    app: agent-network-summarizer
+  ports:
+    - name: http
+      port: 18081
+      targetPort: 18081
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-network-planner-nodeport
+  namespace: agent-network
+spec:
+  type: NodePort
+  selector:
+    app: agent-network-planner
+  ports:
+    - name: http
+      port: 18082
+      targetPort: 18082
+      nodePort: 31882
