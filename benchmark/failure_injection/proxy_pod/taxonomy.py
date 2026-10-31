@@ -46,7 +46,7 @@ _PERSISTENCE_GATE: Dict[Persistence, Dict[str, Any]] = {
     Persistence.SINGLE: {"max_count": 1, "probability": 1.0},
     Persistence.PERSISTENT: {"max_count": sys.maxsize, "probability": 1.0},
     Persistence.INTERMITTENT: {"max_count": sys.maxsize, "probability": 0.3},
-    Persistence.BURST: {"max_count": 10, "probability": 1.0},
+    Persistence.BURST: {"max_count": 50, "probability": 1.0},
 }
 
 

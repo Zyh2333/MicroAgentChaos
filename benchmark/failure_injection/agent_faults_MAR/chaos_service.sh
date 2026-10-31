@@ -139,8 +139,7 @@ wait_for_agent_deployments() {
 }
 
 run_window() {
-  local fault="$1" idx="$2" yaml="" mode="" proxy_manifest run_id user_dir data_dir task_log label_file data_prefix
-  run_id="${service}_${fault}_${idx}"
+  local fault="$1" idx yaml="" mode="" proxy_manifest run_id user_dir data_dir task_log label_file aggregate_label_file label_entry data_prefix sample_parent sample_dir suffix latest_idx=0
   data_prefix="$data_base_prefix"
   if [[ "$inject_fault" == true ]]; then
     mode="$(mode_for_fault "$fault")"
@@ -148,11 +147,30 @@ run_window() {
     data_prefix="$data_base_prefix/$mode"
   fi
   proxy_manifest="${yaml:-$dir/../proxy_pod/deploy/k8s.yaml}"
-  user_dir="$data_prefix/$run_id"
-  data_dir="$benchmark_root/data/$user_dir"
+  sample_parent="$benchmark_root/data/$data_prefix"
+  mkdir -p "$sample_parent"
+  for sample_dir in "$sample_parent/${service}_${fault}_"*; do
+    [[ -d "$sample_dir" ]] || continue
+    suffix="${sample_dir#"$sample_parent/${service}_${fault}_"}"
+    [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+    if (( 10#$suffix > latest_idx )); then latest_idx=$((10#$suffix)); fi
+  done
+  idx=$((latest_idx + 1))
+  while :; do
+    run_id="${service}_${fault}_${idx}"
+    user_dir="$data_prefix/$run_id"
+    data_dir="$benchmark_root/data/$user_dir"
+    if mkdir "$data_dir" 2>/dev/null; then break; fi
+    if [[ -e "$data_dir" ]]; then
+      idx=$((idx + 1))
+      continue
+    fi
+    echo "cannot create sample directory: $data_dir" >&2
+    return 1
+  done
   task_log="$data_dir/task.log"
   label_file="$benchmark_root/data/$data_prefix/${service}_label.txt"
-  mkdir -p "$data_dir"
+  aggregate_label_file="$benchmark_root/data/$data_base_prefix/${service}_label.txt"
 
   phase "$run_id" "applying fault-proxy manifest"
   proxy_deployed=true
@@ -217,7 +235,7 @@ run_window() {
   sleep "$recovery_seconds"
   we_e="$(date +%s)"; we_h="$(date +'%Y-%m-%d %H:%M:%S')"
 
-  {
+  label_entry="$({
     echo "=== $run_id ==="
     echo "service:      $service"
     echo "fault_type:   $fault"
@@ -246,7 +264,12 @@ run_window() {
       echo "proxy_stats:   data/${user_dir}/proxy_stats.json"
     fi
     echo
-  } >> "$label_file"
+  })"
+  if [[ "$label_file" == "$aggregate_label_file" ]]; then
+    printf '%s\n\n' "$label_entry" >> "$label_file"
+  else
+    printf '%s\n\n' "$label_entry" | tee -a "$label_file" "$aggregate_label_file" >/dev/null
+  fi
 
   phase "$run_id" "collecting logs before proxy deletion"
   ( cd "$benchmark_root" && "$python_bin" "$collector" \
@@ -264,8 +287,8 @@ run_window() {
 }
 
 for fault in "${fault_types[@]}"; do
-  for ((idx=1; idx<=total_count; idx++)); do
-    run_window "$fault" "$idx"
+  for ((sample=1; sample<=total_count; sample++)); do
+    run_window "$fault"
   done
 done
 echo "all windows complete for $service -> data/$data_base_prefix"
