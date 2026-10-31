@@ -122,7 +122,7 @@ run_window() {
     # baseline window measures a healthy service rather than pod cold-start.
     kubectl apply -f "$dir/deployments.yaml" 2>/dev/null
     echo "    [$run_id] waiting for deployments to be ready..."
-    kubectl rollout status -f "$dir/deployments.yaml" --timeout=300s 2>/dev/null
+    kubectl rollout status -f "$dir/deployments.yaml" --timeout=600s 2>/dev/null
 
     sleep 60
 

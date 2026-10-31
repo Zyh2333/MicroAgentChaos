@@ -1,0 +1,122 @@
+# Deploy the proxy as a Pod/Service or sidecar.
+# Point the agent dependency URL to this proxy:
+#   env OPENAI_BASE_URL = http://fault-proxy.chaos.svc.cluster.local:18800/v1
+# For a sidecar, add this container to the agent Pod spec.
+# Use localhost:18800 for per-instance faults.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chaos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fault-proxy-config
+  namespace: chaos
+data:
+  # Insert the fault rules here or generate them with kustomize.
+  faults.yaml: |
+    proxy:
+      listen: "0.0.0.0:18800"
+      upstreams:
+        agent-network-marble-research: "http://agent-network-marble-research.agent-network.svc.cluster.local:10202"
+        agent-network-marble-web: "http://agent-network-marble-web.agent-network.svc.cluster.local:10201"
+        agent-network-marble-coding: "http://agent-network-marble-coding.agent-network.svc.cluster.local:10203"
+        agent-network-marble-database: "http://agent-network-marble-database.agent-network.svc.cluster.local:10204"
+        agent-network-marble-world: "http://agent-network-marble-world.agent-network.svc.cluster.local:10205"
+        agent-network-marble-werewolf: "http://agent-network-marble-werewolf.agent-network.svc.cluster.local:10207"
+        agent-network-marble-minecraft: "http://agent-network-marble-minecraft.agent-network.svc.cluster.local:10206"
+        agent-network-planner: "http://agent-network-planner.agent-network.svc.cluster.local:18082"
+        agent-network-summarizer: "http://agent-network-summarizer.agent-network.svc.cluster.local:18081"
+        agent-network-csv-gen: "http://agent-network-csv-gen.agent-network.svc.cluster.local:10121"
+        agent-network-direction: "http://agent-network-direction.agent-network.svc.cluster.local:10097"
+        agent-network-excel-gen: "http://agent-network-excel-gen.agent-network.svc.cluster.local:10109"
+        agent-network-excel-parsing: "http://agent-network-excel-parsing.agent-network.svc.cluster.local:10094"
+        agent-network-image: "http://agent-network-image.agent-network.svc.cluster.local:18080"
+        agent-network-image-gen: "http://agent-network-image-gen.agent-network.svc.cluster.local:10111"
+        agent-network-ocr: "http://agent-network-ocr.agent-network.svc.cluster.local:19090"
+        agent-network-pdf-gen: "http://agent-network-pdf-gen.agent-network.svc.cluster.local:10110"
+        agent-network-pdf-parsing: "http://agent-network-pdf-parsing.agent-network.svc.cluster.local:10091"
+        agent-network-word-gen: "http://agent-network-word-gen.agent-network.svc.cluster.local:10108"
+        agent-network-word-parsing: "http://agent-network-word-parsing.agent-network.svc.cluster.local:10098"
+        deepseek: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        qwen: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+      default_upstream: "qwen"
+      routes:
+        - { path_prefix: "/v1", upstream: "qwen" }
+    faults:
+    - id: agent-network-pdf-parsing__f3_missing_task_id
+      category: F3
+      description: Remove taskId from cross-service requests to violate the parameter contract
+      scope: call
+      persistence: persistent
+      propagation: downstream
+      recovery: retry
+      match:
+        upstream: agent-network-pdf-parsing
+        methods:
+        - POST
+        path_prefix: /service
+      stage: request
+      action: remove_query
+      target_path: $.taskId
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-proxy
+  namespace: chaos
+  labels: { app: fault-proxy }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fault-proxy }
+  template:
+    metadata:
+      labels: { app: fault-proxy }
+    spec:
+      containers:
+        - name: fault-proxy
+          image: 47.121.177.73:81/agent/fault-proxy:latest  # Replace with your proxy image.
+          imagePullPolicy: Always
+          args:
+            - "--config"
+            - "/etc/fault-proxy/faults.yaml"
+            - "--start-without-faults"
+            - "--listen"
+            - "0.0.0.0:18800"
+            - "--log"
+            - "/var/log/fault-proxy/fires.jsonl"
+          ports:
+            - containerPort: 18800
+          volumeMounts:
+            - name: config
+              mountPath: /etc/fault-proxy
+            - name: logs
+              mountPath: /var/log/fault-proxy
+          readinessProbe:
+            httpGet: { path: /__fault__/health, port: 18800 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /__fault__/health, port: 18800 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: fault-proxy-config
+            items:
+              - { key: faults.yaml, path: faults.yaml }
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fault-proxy
+  namespace: chaos
+spec:
+  selector: { app: fault-proxy }
+  ports:
+    - { name: http, port: 18800, targetPort: 18800 }

@@ -39,7 +39,7 @@ data:
         agent-network-pdf-parsing: "http://agent-network-pdf-parsing.agent-network.svc.cluster.local:10091"
         agent-network-word-gen: "http://agent-network-word-gen.agent-network.svc.cluster.local:10108"
         agent-network-word-parsing: "http://agent-network-word-parsing.agent-network.svc.cluster.local:10098"
-        deepseek: "https://api.deepseek.com"
+        deepseek: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
         qwen: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
       default_upstream: "qwen"
       routes:
@@ -75,7 +75,7 @@ spec:
       containers:
         - name: fault-proxy
           image: 47.121.177.73:81/agent/fault-proxy:latest  # Replace with your proxy image.
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args:
             - "--config"
             - "/etc/fault-proxy/faults.yaml"

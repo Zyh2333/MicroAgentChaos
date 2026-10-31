@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import os
+from urllib.parse import urlencode
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -91,7 +92,6 @@ class ProxyApp:
         self.cfg = cfg
         self.engine = engine
         self._session: Optional[ClientSession] = None
-        self._resp_cache: Dict[str, dict] = {}
 
     async def start(self):
         self._session = ClientSession(timeout=ClientTimeout(total=self.cfg.timeout_s))
@@ -147,7 +147,6 @@ class ProxyApp:
 
     async def ctl_clear(self, request: web.Request):
         self.engine.clear_rules()
-        self._resp_cache.clear()
         return web.json_response({"status": "cleared", "rules": 0})
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
@@ -155,13 +154,17 @@ class ProxyApp:
         if up_base is None:
             return web.json_response(
                 {"error": "no upstream resolved",
-                 "hint": f"设置 default_upstream / routes / 请求头 {self.cfg.upstream_header} "
-                         f"(逻辑名)或 {self.cfg.upstream_url_header} (物理地址)"}, status=502)
+                 "hint": f"Set default_upstream, routes, or the {self.cfg.upstream_header} "
+                         f"header (logical name), or use {self.cfg.upstream_url_header} "
+                         "(upstream URL)"}, status=502)
 
         raw = await request.read()
         req_json = self._try_json(request.headers.get("Content-Type", ""), raw)
         ctx = RequestCtx(method=request.method, path=request.path,
-                         headers=dict(request.headers), upstream=up_name, taskId=request.headers.get(self.cfg.taskId_header))
+                         headers=dict(request.headers), upstream=up_name,
+                         taskId=request.headers.get(self.cfg.taskId_header),
+                         query=list(request.query.items()),
+                         request_body_bytes=len(raw))
 
         out = self.engine.apply("request", ctx, req_json)
         if out.delay_ms > 0:
@@ -170,9 +173,7 @@ class ProxyApp:
             return self._abort_response(out)
         if out.short_circuit == "drop":
             # Return 504 for a dropped connection without hanging the caller.
-            return web.json_response(
-                {"error": {"type": "fault_injected", "message": "connection dropped (timeout)"},
-                 "fired": out.fired}, status=504)
+            return web.json_response(out.body, status=out.status)
 
         send_body = raw
         if req_json is not None:
@@ -188,6 +189,10 @@ class ProxyApp:
         path_qs = request.path_qs
         if up_base.rstrip("/").endswith("/v1") and request.path.startswith("/v1/"):
             path_qs = path_qs[3:]
+        if out.query_mutated:
+            path = path_qs.split("?", 1)[0]
+            query = urlencode(out.query_value)
+            path_qs = f"{path}?{query}" if query else path
         url = up_base.rstrip("/") + path_qs
         fwd_headers = {k: v for k, v in request.headers.items()
                        if k.lower() not in _HOP_BY_HOP}
@@ -210,6 +215,9 @@ class ProxyApp:
             return web.Response(body=resp_bytes, status=resp_status, headers=resp_headers)
 
         resp_json = self._try_json(resp_ctype, resp_bytes)
+        ctx.response_status = resp_status
+        ctx.response_content_type = resp_ctype
+        ctx.response_body_bytes = len(resp_bytes)
 
         rout = self.engine.apply("response", ctx, resp_json)
         if rout.delay_ms > 0:
@@ -217,22 +225,10 @@ class ProxyApp:
         if rout.short_circuit == "abort":
             return self._abort_response(rout)
         if rout.short_circuit == "drop":
-            return web.json_response(
-                {"error": {"type": "fault_injected", "message": "response dropped (timeout)"},
-                 "fired": rout.fired}, status=504)
+            return web.json_response(rout.body, status=rout.status)
 
-        # Replay the previous response for this upstream and path.
-        cache_key = f"{up_name}:{request.path}"
-        dup = any(f.get("action") == "duplicate" for f in rout.fired)
-        if resp_json is not None and isinstance(resp_json, dict):
-            if dup and cache_key in self._resp_cache:
-                body_obj = self._resp_cache[cache_key]
-                resp_bytes = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
-            elif rout.body_mutated:
-                resp_bytes = json.dumps(rout.body_value, ensure_ascii=False).encode("utf-8")
-            # Cache this response for a later duplicate action.
-            if not dup:
-                self._resp_cache[cache_key] = resp_json
+        if rout.body_mutated:
+            resp_bytes = json.dumps(rout.body_value, ensure_ascii=False).encode("utf-8")
             resp_headers.pop("Content-Length", None)
 
         return web.Response(body=resp_bytes, status=resp_status, headers=resp_headers)
@@ -284,17 +280,17 @@ def build_app(cfg: ProxyConfig, engine: ProxyFaultEngine) -> web.Application:
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Agent Service 故障注入代理 Pod")
-    p.add_argument("--config", default="config/faults.example.yaml", help="YAML 故障清单(含 proxy 段与 faults 列表)")
+    p = argparse.ArgumentParser(description="Agent Service fault injection proxy Pod")
+    p.add_argument("--config", default="config/faults.example.yaml", help="YAML configuration with proxy and faults sections")
     p.add_argument("--start-without-faults", action="store_true",
-                   help="启动时仅加载代理配置，故障规则由控制接口稍后注入")
-    p.add_argument("--listen", help="监听地址, 如 0.0.0.0:8900")
+                   help="Load only proxy settings at startup; install fault rules later through the control API")
+    p.add_argument("--listen", help="Listen address, for example 0.0.0.0:8900")
     p.add_argument("--upstream", action="append", default=[],
-                   help="上游定义 name=base_url, 可重复")
-    p.add_argument("--default-upstream", help="默认上游名")
-    p.add_argument("--log", help="命中日志(JSONL)输出路径")
+                   help="Upstream definition name=base_url; may be repeated")
+    p.add_argument("--default-upstream", help="Default upstream name")
+    p.add_argument("--log", help="Path for fault hit logs (JSONL)")
     p.add_argument("--force-non-stream", action="store_true",
-                   help="把 LLM 请求的 stream 置 false, 以便对响应体注入故障")
+                   help="Set stream=false on LLM requests so response body faults can be injected")
     args = p.parse_args(argv)
 
     raw = {}

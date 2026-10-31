@@ -46,7 +46,7 @@ _PERSISTENCE_GATE: Dict[Persistence, Dict[str, Any]] = {
     Persistence.SINGLE: {"max_count": 1, "probability": 1.0},
     Persistence.PERSISTENT: {"max_count": sys.maxsize, "probability": 1.0},
     Persistence.INTERMITTENT: {"max_count": sys.maxsize, "probability": 0.3},
-    Persistence.BURST: {"max_count": 3, "probability": 1.0},
+    Persistence.BURST: {"max_count": 10, "probability": 1.0},
 }
 
 
@@ -77,6 +77,7 @@ class Match:
 
 ACTIONS = {
     "abort", "delay", "drop", "set_json", "remove_json",
+    "set_query", "remove_query",
     "corrupt", "truncate", "duplicate",
 }
 
@@ -156,6 +157,15 @@ class FaultRule:
         action = d.get("action", "abort")
         if action not in ACTIONS:
             raise ValueError(f"action 必须是 {ACTIONS}, 收到 {action!r}")
+        if action in {"set_query", "remove_query"}:
+            if stage != "request":
+                raise ValueError(f"{action} 只能用于 request 阶段")
+            target_path = d.get("target_path", "$")
+            if not isinstance(target_path, str) or not target_path.startswith("$.") \
+                    or not target_path[2:] or any(c in target_path[2:] for c in ".[]"):
+                raise ValueError(f"{action} 的 target_path 必须是单个查询参数，如 $.taskId")
+            if action == "set_query" and d.get("value") is None:
+                raise ValueError("set_query 需要非 null 的 value")
 
         return FaultRule(
             id=d["id"],

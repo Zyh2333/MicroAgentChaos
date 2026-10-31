@@ -14,7 +14,7 @@ if [[ $# -ge 2 ]]; then shift 2; else shift; fi
 fault_types=("$@")
 if [[ ${#fault_types[@]} -eq 0 ]]; then
   fault_types=(f1_unavailable f1_slow f1_network_drop f2_auth f2_quota \
-               f3_missing_task_id f3_response_drop f4_no_tool_calls f4_truncated_result)
+               f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result)
 fi
 
 case "${INJECT_FAULT:-true}" in
@@ -31,10 +31,25 @@ case "$(basename "$dir")" in
   *) echo "unexpected script directory: $dir" >&2; exit 2 ;;
 esac
 [[ -d "$dir/$service" ]] || { echo "unknown service: $service" >&2; exit 2; }
+mode_for_fault() {
+  if [[ -n "${FAULT_MODE:-}" ]]; then
+    case "$FAULT_MODE" in
+      single|persistent|intermittent|burst) printf '%s\n' "$FAULT_MODE" ;;
+      *) echo "FAULT_MODE must be single, persistent, intermittent, or burst" >&2; return 2 ;;
+    esac
+    return
+  fi
+  case "$1" in
+    f1_network_drop|f3_response_drop) echo intermittent ;;
+    f4_no_tool_calls|f4_truncated_result) echo single ;;
+    *) echo persistent ;;
+  esac
+}
 if [[ "$inject_fault" == true ]]; then
   for fault in "${fault_types[@]}"; do
-    [[ "$fault" =~ ^f[1-4]_[a-z0-9_]+$ && -f "$dir/$service/$fault.yaml" ]] || {
-      echo "missing/invalid fault YAML: $dir/$service/$fault.yaml" >&2; exit 2;
+    mode="$(mode_for_fault "$fault")"
+    [[ "$fault" =~ ^f[1-4]_[a-z0-9_]+$ && -f "$dir/$service/$mode/$fault.yaml" ]] || {
+      echo "missing/invalid fault YAML: $dir/$service/$mode/$fault.yaml" >&2; exit 2;
     }
   done
 fi
@@ -45,7 +60,7 @@ python_bin="${PYTHON:-$repo_root/.venv/bin/python}"
 collector="$benchmark_root/data-collector/Main.py"
 proxy_rules="$dir/../proxy_rules.py"
 locustfile="${LOCUSTFILE:-$default_locustfile}"
-locust_users="${LOCUST_USERS:-3}"
+locust_users="${LOCUST_USERS:-64}"
 locust_spawn_rate="${LOCUST_SPAWN_RATE:-10}"
 locust_stop_timeout="${LOCUST_STOP_TIMEOUT:-600}"
 [[ "$locust_stop_timeout" =~ ^[1-9][0-9]*$ ]] || { echo "LOCUST_STOP_TIMEOUT must be a positive integer" >&2; exit 2; }
@@ -60,9 +75,7 @@ if [[ "$inject_fault" == true ]]; then
 else
   default_prefix="$dataset/agent_faults/normal/load-${locust_users}"
 fi
-data_prefix="${DATA_PREFIX:-$default_prefix}"
-label_file="$benchmark_root/data/$data_prefix/${service}_label.txt"
-mkdir -p "$(dirname "$label_file")"
+data_base_prefix="${DATA_PREFIX:-$default_prefix}"
 
 # Match the old MAR 20-minute window by default; unlike the old MDOC script,
 # FAULT_SECONDS is nonzero so a fault can actually be observed.
@@ -108,14 +121,37 @@ phase() {
   printf '[%s] %s: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$1" "$2"
 }
 
+wait_for_agent_deployments() {
+  local run_id="$1" deployments deployment deadline remaining
+  deployments="$(kubectl -n agent-network get deployments -o name)"
+  [[ -n "$deployments" ]] || { echo "no Deployments found in agent-network" >&2; return 1; }
+  deadline=$(( $(date +%s) + 600 ))
+  phase "$run_id" "waiting for all agent-network Deployments to roll out"
+  while IFS= read -r deployment; do
+    [[ -n "$deployment" ]] || continue
+    remaining=$((deadline - $(date +%s)))
+    if (( remaining <= 0 )); then
+      echo "timed out waiting for all agent-network Deployments" >&2
+      return 1
+    fi
+    kubectl -n agent-network rollout status "$deployment" --timeout="${remaining}s"
+  done <<< "$deployments"
+}
+
 run_window() {
-  local fault="$1" idx="$2" yaml="" proxy_manifest run_id user_dir data_dir task_log
+  local fault="$1" idx="$2" yaml="" mode="" proxy_manifest run_id user_dir data_dir task_log label_file data_prefix
   run_id="${service}_${fault}_${idx}"
-  if [[ "$inject_fault" == true ]]; then yaml="$dir/$service/$fault.yaml"; fi
+  data_prefix="$data_base_prefix"
+  if [[ "$inject_fault" == true ]]; then
+    mode="$(mode_for_fault "$fault")"
+    yaml="$dir/$service/$mode/$fault.yaml"
+    data_prefix="$data_base_prefix/$mode"
+  fi
   proxy_manifest="${yaml:-$dir/../proxy_pod/deploy/k8s.yaml}"
   user_dir="$data_prefix/$run_id"
   data_dir="$benchmark_root/data/$user_dir"
   task_log="$data_dir/task.log"
+  label_file="$benchmark_root/data/$data_prefix/${service}_label.txt"
   mkdir -p "$data_dir"
 
   phase "$run_id" "applying fault-proxy manifest"
@@ -127,15 +163,12 @@ run_window() {
       --ignore-not-found --wait=true
   fi
   kubectl apply -f "$proxy_manifest"
-  kubectl -n chaos rollout status deployment/fault-proxy --timeout=300s
+  kubectl -n chaos rollout status deployment/fault-proxy --timeout=600s
   if [[ "$manage_deployments" == true ]]; then
     kubectl apply -f "$deployments_file"
     deployed=true
-    kubectl -n agent-network rollout status "deployment/$service" --timeout=300s
-    if [[ "$service" != "agent-network-planner" ]]; then
-      kubectl -n agent-network rollout status deployment/agent-network-planner --timeout=300s
-    fi
   fi
+  wait_for_agent_deployments "$run_id"
   # A clean baseline is required even when the previous run was interrupted.
   phase "$run_id" "clearing proxy rules"
   "$python_bin" "$proxy_rules" clear >/dev/null
@@ -188,6 +221,7 @@ run_window() {
     echo "=== $run_id ==="
     echo "service:      $service"
     echo "fault_type:   $fault"
+    if [[ "$inject_fault" == true ]]; then echo "persistence:  $mode"; fi
     echo "fault_injection: $inject_fault"
     if [[ "$inject_fault" == true ]]; then
       echo "root_cause:   $service/$fault"
@@ -234,4 +268,4 @@ for fault in "${fault_types[@]}"; do
     run_window "$fault" "$idx"
   done
 done
-echo "all windows complete for $service -> $label_file"
+echo "all windows complete for $service -> data/$data_base_prefix"

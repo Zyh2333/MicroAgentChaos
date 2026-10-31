@@ -8,7 +8,7 @@ proxy:
   listen: "0.0.0.0:8900"
   upstreams:
     # llm: "https://api.openai.com"
-    deepseek: "https://api.deepseek.com"
+    deepseek: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
     qwen: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode"
     tool: "http://tool-service.default.svc.cluster.local:8080"
   default_upstream: "qwen"
@@ -21,7 +21,7 @@ faults:
 
   - id: f1_pod_crash_503
     category: F1
-    description: "上游实例崩溃/不可用(503), 服务级持续故障, 需重启恢复"
+    description: "Upstream instance crashed or unavailable (503); persistent service fault requiring restart"
     scope: service
     persistence: persistent
     propagation: downstream
@@ -34,7 +34,7 @@ faults:
 
   - id: f1_resource_exhaustion_slow
     category: F1
-    description: "资源耗尽导致处理变慢(持续注入 8s 延迟)"
+    description: "Resource exhaustion slows processing (continuous 8-second delay)"
     scope: service
     persistence: persistent
     propagation: downstream
@@ -46,7 +46,7 @@ faults:
 
   - id: f1_network_unreachable
     category: F1
-    description: "网络不可达: 连接被丢弃/超时(间歇 30%)"
+    description: "Network unreachable: connection dropped or timed out intermittently (30%)"
     scope: call
     persistence: intermittent
     propagation: local
@@ -58,7 +58,7 @@ faults:
 
   - id: f2_auth_fail_call
     category: F2
-    description: "单次调用携带错误凭据 -> 401(调用级)"
+    description: "Invalid credentials on a single call cause 401 (request scope)"
     scope: call
     persistence: single
     propagation: local
@@ -73,7 +73,7 @@ faults:
 
   - id: f2_auth_fail_service
     category: F2
-    description: "某服务配置的 API Key 过期 -> 该服务全部调用 401(服务级持续)"
+    description: "Expired API key for one service causes 401 on all its calls (persistent service fault)"
     scope: service
     persistence: persistent
     propagation: cross_task
@@ -88,7 +88,7 @@ faults:
 
   - id: f2_auth_fail_cross_service
     category: F2
-    description: "多服务共享的 API Key 过期 -> 命中该上游全部调用(跨服务级联)"
+    description: "Expired shared API key affects all calls to the matched upstream (cross-service propagation)"
     scope: cross_service
     persistence: persistent
     propagation: cross_service
@@ -102,7 +102,7 @@ faults:
 
   - id: f2_quota_exhausted_429
     category: F2
-    description: "配额/额度耗尽 -> 429(突发 3 次后恢复)"
+    description: "Quota exhausted: return 429 for three calls, then recover"
     scope: cross_service
     persistence: burst
     propagation: cross_service
@@ -115,7 +115,7 @@ faults:
 
   - id: f2_model_mapping_error
     category: F2
-    description: "模型与 base_url 映射错误: 把请求模型改成未授权模型 -> 下游 403/404"
+    description: "Incorrect model-to-base_url mapping: replace requested model with an unauthorized model, causing downstream 403 or 404"
     scope: service
     persistence: persistent
     propagation: downstream
@@ -129,7 +129,7 @@ faults:
 
   - id: f3_missing_required_param
     category: F3
-    description: "删除下游工具调用的必填参数 -> 参数契约错误"
+    description: "Remove a required downstream tool argument to violate the parameter contract"
     scope: call
     persistence: intermittent
     propagation: downstream
@@ -139,9 +139,36 @@ faults:
     action: remove_json
     target_path: "$.arguments.query"
 
+  - id: f3_set_task_id_query
+    category: F3
+    description: "Replace the taskId URL query parameter on a cross-service request"
+    scope: call
+    persistence: single
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "tool", methods: ["POST"], path_prefix: "/service" }
+    stage: request
+    action: set_query
+    target_path: "$.taskId"
+    value: "invalid-task-id"
+    enabled: false
+
+  - id: f3_remove_task_id_query
+    category: F3
+    description: "Remove the taskId URL query parameter from a cross-service request"
+    scope: call
+    persistence: single
+    propagation: downstream
+    recovery: retry
+    match: { upstream: "tool", methods: ["POST"], path_prefix: "/service" }
+    stage: request
+    action: remove_query
+    target_path: "$.taskId"
+    enabled: false
+
   - id: f3_response_schema_mismatch
     category: F3
-    description: "篡改响应 schema: 把结果字段设为错误类型 -> 调用方解析失败"
+    description: "Corrupt response schema by assigning the wrong type to a result field, causing caller parsing failure"
     scope: call
     persistence: single
     propagation: downstream
@@ -154,7 +181,7 @@ faults:
 
   - id: f3_response_corrupt
     category: F3
-    description: "响应体编码损坏(mojibake), 模拟跨服务字符集不一致"
+    description: "Corrupt response encoding (mojibake) to simulate cross-service charset mismatch"
     scope: call
     persistence: intermittent
     propagation: downstream
@@ -167,7 +194,7 @@ faults:
 
   - id: f3_message_lost
     category: F3
-    description: "服务间消息丢失: 响应被丢弃(超时)"
+    description: "Cross-service message loss: drop the response to simulate a timeout"
     scope: call
     persistence: intermittent
     propagation: cross_task
@@ -179,7 +206,7 @@ faults:
 
   - id: f4_tool_calls_stripped
     category: F4
-    description: "清空 LLM 返回的 tool_calls -> 工具从不被调用(执行流程断裂)"
+    description: "Remove tool_calls from the LLM response so tools are never called"
     scope: task
     persistence: single
     propagation: downstream
@@ -192,7 +219,7 @@ faults:
 
   - id: f4_repeated_execution
     category: F4
-    description: "重放上一次 LLM 响应 -> 步骤重复执行(第 2 次起生效)"
+    description: "Replay the previous LLM response to repeat a step (effective from the second call)"
     scope: task
     persistence: persistent
     propagation: cross_task
@@ -204,7 +231,7 @@ faults:
 
   - id: f4_premature_truncation
     category: F4
-    description: "截断 LLM 输出至 30% -> 结果不完整/提前终止"
+    description: "Truncate LLM output to 30% to simulate incomplete results or early termination"
     scope: call
     persistence: single
     propagation: local
