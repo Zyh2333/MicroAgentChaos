@@ -54,6 +54,7 @@ data:
       recovery: retry
       match:
         upstream: qwen
+        source_service: agent-network-ocr
         methods:
         - POST
         path_regex: /chat/completions$

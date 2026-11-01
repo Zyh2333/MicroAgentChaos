@@ -56,6 +56,7 @@ data:
       max_count: 11
       match:
         upstream: qwen
+        source_service: agent-network-marble-world
         methods:
         - POST
         path_regex: /chat/completions$

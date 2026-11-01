@@ -24,6 +24,7 @@ except ImportError:
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "x-agent-service",  # Proxy matching metadata; do not send it to the LLM provider.
 }
 
 
@@ -162,6 +163,7 @@ class ProxyApp:
         req_json = self._try_json(request.headers.get("Content-Type", ""), raw)
         ctx = RequestCtx(method=request.method, path=request.path,
                          headers=dict(request.headers), upstream=up_name,
+                         source_service=request.headers.get("X-Agent-Service"),
                          taskId=request.headers.get(self.cfg.taskId_header),
                          query=list(request.query.items()),
                          request_body_bytes=len(raw))

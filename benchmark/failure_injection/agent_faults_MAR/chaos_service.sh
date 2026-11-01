@@ -76,6 +76,9 @@ else
   default_prefix="$dataset/agent_faults/normal/load-${locust_users}"
 fi
 data_base_prefix="${DATA_PREFIX:-$default_prefix}"
+if [[ "$service" == common ]]; then
+  [[ "$data_base_prefix" == */common ]] || data_base_prefix="$data_base_prefix/common"
+fi
 
 # Match the old MAR 20-minute window by default; unlike the old MDOC script,
 # FAULT_SECONDS is nonzero so a fault can actually be observed.

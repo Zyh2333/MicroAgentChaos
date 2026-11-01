@@ -15,6 +15,26 @@ def _write_metric_csv(metric_df: pd.DataFrame, path: str, is_header: bool, missi
     metric_df.to_csv(path, index=False, mode='a', header=is_header)
 
 
+def _prometheus_matrix(responses):
+    """Join Prometheus range series on their actual sample timestamps."""
+    columns = {}
+    for results, suffix, name_of in responses:
+        for result in results:
+            values = result['values']
+            if not values:
+                continue
+            name = name_of(result['metric']) + suffix
+            columns[name] = pd.Series(
+                [float(value) for _, value in values],
+                index=pd.to_datetime([timestamp for timestamp, _ in values], unit='s'),
+            )
+    if not columns:
+        return pd.DataFrame(columns=['timestamp'])
+    frame = pd.DataFrame(columns).sort_index()
+    frame.index.name = 'timestamp'
+    return frame.reset_index()
+
+
 def collect_graph(config: Config, _dir: str, is_header: bool):
     graph_df = pd.DataFrame(columns=['source', 'destination'])
     prom_util = PrometheusClient(config)
@@ -70,8 +90,6 @@ def collect_graph(config: Config, _dir: str, is_header: bool):
 
 # Get the response time of the invocation edges
 def collect_call_latency(config: Config, _dir: str, is_header: bool):
-    call_df = pd.DataFrame()
-
     prom_util = PrometheusClient(config)
     # P50，P90，P99
     prom_50_sql = 'histogram_quantile(0.50, sum(irate(istio_request_duration_milliseconds_bucket{destination_workload_namespace=\"%s\"}[1m])) by (destination_workload, destination_workload_namespace, source_workload, le))' % config.namespace
@@ -81,23 +99,11 @@ def collect_call_latency(config: Config, _dir: str, is_header: bool):
     responses_90 = prom_util.execute_prom(config.prom_range_url, prom_90_sql)
     responses_99 = prom_util.execute_prom(config.prom_range_url, prom_99_sql)
 
-    def handle(result, call_df, type):
-        name = result['metric']['source_workload'] + '_' + result['metric']['destination_workload']
-        values = result['values']
-        values = list(zip(*values))
-        if 'timestamp' not in call_df:
-            timestamp = values[0]
-            call_df['timestamp'] = timestamp
-            call_df['timestamp'] = call_df['timestamp'].astype('datetime64[s]')
-        metric = values[1]
-        key = name + '&' + type
-        call_df[key] = pd.Series(metric)
-        call_df[key] = call_df[key].fillna(-1)
-        call_df[key] = call_df[key].astype('float64')
-
-    [handle(result, call_df, 'p50') for result in responses_50]
-    [handle(result, call_df, 'p90') for result in responses_90]
-    [handle(result, call_df, 'p99') for result in responses_99]
+    call_df = _prometheus_matrix([
+        (responses_50, '&p50', lambda m: m['source_workload'] + '_' + m['destination_workload']),
+        (responses_90, '&p90', lambda m: m['source_workload'] + '_' + m['destination_workload']),
+        (responses_99, '&p99', lambda m: m['source_workload'] + '_' + m['destination_workload']),
+    ])
 
     path = os.path.join(_dir, 'call.csv')
     _write_metric_csv(call_df, path, is_header)
@@ -105,8 +111,6 @@ def collect_call_latency(config: Config, _dir: str, is_header: bool):
 
 # Get the response time for the microservices
 def collect_svc_latency(config: Config, _dir: str, is_header: bool):
-    latency_df = pd.DataFrame()
-
     prom_util = PrometheusClient(config)
     # P50，P90，P99
     prom_50_sql = 'histogram_quantile(0.50, sum(irate(istio_request_duration_milliseconds_bucket{reporter=\"destination\", destination_workload_namespace=\"%s\"}[1m])) by (destination_workload, destination_workload_namespace, le))' % config.namespace
@@ -116,23 +120,11 @@ def collect_svc_latency(config: Config, _dir: str, is_header: bool):
     responses_90 = prom_util.execute_prom(config.prom_range_url, prom_90_sql)
     responses_99 = prom_util.execute_prom(config.prom_range_url, prom_99_sql)
 
-    def handle(result, latency_df, type):
-        name = result['metric']['destination_workload']
-        values = result['values']
-        values = list(zip(*values))
-        if 'timestamp' not in latency_df:
-            timestamp = values[0]
-            latency_df['timestamp'] = timestamp
-            latency_df['timestamp'] = latency_df['timestamp'].astype('datetime64[s]')
-        metric = values[1]
-        key = name + '&' + type
-        latency_df[key] = pd.Series(metric)
-        latency_df[key] = latency_df[key].fillna(-1)
-        latency_df[key] = latency_df[key].astype('float64')
-
-    [handle(result, latency_df, 'p50') for result in responses_50]
-    [handle(result, latency_df, 'p90') for result in responses_90]
-    [handle(result, latency_df, 'p99') for result in responses_99]
+    latency_df = _prometheus_matrix([
+        (responses_50, '&p50', lambda m: m['destination_workload']),
+        (responses_90, '&p90', lambda m: m['destination_workload']),
+        (responses_99, '&p99', lambda m: m['destination_workload']),
+    ])
 
     path = os.path.join(_dir, 'latency.csv')
     _write_metric_csv(latency_df, path, is_header)
@@ -201,25 +193,11 @@ def collect_pod_num(config: Config, _dir: str, is_header: bool):
 
 # get qps for microservice
 def collect_svc_qps(config: Config, _dir: str, is_header: bool):
-    qps_df = pd.DataFrame()
     prom_util = PrometheusClient(config)
     qps_sql = 'sum(rate(istio_requests_total{reporter="destination",namespace="%s"}[30s])) by (destination_workload)' % config.namespace
     response = prom_util.execute_prom(config.prom_range_url, qps_sql)
 
-    def handle(result, qps_df):
-        name = result['metric']['destination_workload']
-        values = result['values']
-        values = list(zip(*values))
-        if 'timestamp' not in qps_df:
-            timestamp = values[0]
-            qps_df['timestamp'] = timestamp
-            qps_df['timestamp'] = qps_df['timestamp'].astype('datetime64[s]')
-        metric = values[1]
-        qps_df[name] = pd.Series(metric)
-        qps_df[name] = qps_df[name].fillna(-1)
-        qps_df[name] = qps_df[name].astype('float64')
-
-    [handle(result, qps_df) for result in response]
+    qps_df = _prometheus_matrix([(response, '', lambda m: m['destination_workload'])])
 
     path = os.path.join(_dir, 'svc_qps.csv')
     _write_metric_csv(qps_df, path, is_header)
@@ -381,25 +359,12 @@ def collect_ctn_metric(config: Config, _dir: str, is_header: bool):
 
 # Get the success rate for microservices
 def collect_succeess_rate(config: Config, _dir: str, is_header: bool):
-    success_df = pd.DataFrame()
     prom_util = PrometheusClient(config)
     success_rate_sql = '(sum(rate(istio_requests_total{reporter="destination", response_code!~"5.*",namespace="%s"}[1m])) by (destination_workload, destination_workload_namespace) / sum(rate(istio_requests_total{reporter="destination",namespace="%s"}[1m])) by (destination_workload, destination_workload_namespace))' % (
         config.namespace, config.namespace)
     response = prom_util.execute_prom(config.prom_range_url, success_rate_sql)
 
-    def handle(result, success_df):
-        name = result['metric']['destination_workload']
-        values = result['values']
-        values = list(zip(*values))
-        if 'timestamp' not in success_df:
-            timestamp = values[0]
-            success_df['timestamp'] = timestamp
-            success_df['timestamp'] = success_df['timestamp'].astype('datetime64[s]')
-        metric = values[1]
-        success_df[name] = pd.Series(metric)
-        success_df[name] = success_df[name].astype('float64')
-
-    [handle(result, success_df) for result in response]
+    success_df = _prometheus_matrix([(response, '', lambda m: m['destination_workload'])])
 
     path = os.path.join(_dir, 'success_rate.csv')
     _write_metric_csv(success_df, path, is_header)

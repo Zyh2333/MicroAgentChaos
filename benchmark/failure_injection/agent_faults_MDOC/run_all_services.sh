@@ -21,6 +21,9 @@ services=(
 export LOCUST_USERS="${LOCUST_USERS:-64}"
 export LOCUST_SPAWN_RATE="${LOCUST_SPAWN_RATE:-10}"
 export INJECT_FAULT="${INJECT_FAULT:-true}"
+if [[ "$INJECT_FAULT" =~ ^(true|TRUE|1|yes|YES|on|ON)$ ]]; then
+  services+=(common)
+fi
 if [[ -z "${LOCUST_HOST:-}" ]]; then
   : "${HOST_IP:?Set HOST_IP to a Kubernetes node address, or set LOCUST_HOST}"
   export LOCUST_HOST="http://${HOST_IP}:${PLANNER_NODEPORT:-31882}"

@@ -27,6 +27,7 @@ class RequestCtx:
     path: str
     headers: dict
     upstream: Optional[str] = None
+    source_service: Optional[str] = None
     taskId: Optional[str] = None
     query: list[tuple[str, str]] = field(default_factory=list)
     request_body_bytes: Optional[int] = None
@@ -74,7 +75,7 @@ class ProxyFaultEngine:
         self.fire_log: List[dict] = []
         self._total_fires = 0
         self._max_fires = max_fires  # Limit total injected faults.
-        self._resp_cache: dict[tuple[Optional[str], str], Any] = {}
+        self._resp_cache: dict[tuple[Optional[str], Optional[str], str], Any] = {}
 
     def set_rules(self, rules: List[FaultRule]):
         with self._lock:
@@ -108,6 +109,8 @@ class ProxyFaultEngine:
     def _matches(self, rule: FaultRule, ctx: RequestCtx, body: Any) -> bool:
         m = rule.match
         if m.upstream and m.upstream != ctx.upstream:
+            return False
+        if m.source_service and m.source_service != ctx.source_service:
             return False
         if m.methods and ctx.method.upper() not in m.methods:
             return False
@@ -165,7 +168,7 @@ class ProxyFaultEngine:
 
     def apply(self, stage: str, ctx: RequestCtx, body: Any) -> Outcome:
         out = Outcome(body_value=body, query_value=list(ctx.query))
-        cache_key = (ctx.upstream, ctx.path)
+        cache_key = (ctx.source_service, ctx.upstream, ctx.path)
         previous_response = None
         if stage == "response":
             with self._lock:
@@ -336,6 +339,7 @@ class ProxyFaultEngine:
             "method": ctx.method,
             "path": ctx.path,
             "upstream": ctx.upstream,
+            "source_service": ctx.source_service,
             "description": rule.description,
             "taskId": ctx.taskId,
             "request_query": list(ctx.query),
@@ -345,7 +349,7 @@ class ProxyFaultEngine:
             "response_content_type": ctx.response_content_type if rule.stage == "response" else None,
             "response_body_bytes": ctx.response_body_bytes if rule.stage == "response" else None,
             "routing_headers": {name: value for name in (
-                "X-Upstream", "X-Upstream-Url", "X-Agent-Target-Zone",
+                "X-Upstream", "X-Upstream-Url", "X-Agent-Service", "X-Agent-Target-Zone",
                 "X-Agent-Degrade-Stage", "X-Forwarded-For")
                 if (value := ctx.header(name)) is not None},
             "effective_probability": rule.eff_probability,

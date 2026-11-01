@@ -3,7 +3,8 @@
 set -euo pipefail
 service="agent-network-pdf-gen"
 total_count="${SAMPLES_PER_FAULT:-1}"
-read -r -a faults <<< "${FAULT_TYPES:-f1_unavailable f1_slow f1_network_drop f2_auth f2_quota f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result}"
+# read -r -a faults <<< "${FAULT_TYPES:-f1_unavailable f1_slow f1_network_drop f2_auth f2_quota f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result}"
+read -r -a faults <<< "${FAULT_TYPES:-f1_network_drop f3_missing_task_id f3_response_drop  f4_truncated_result}"
 # read -r -a faults <<< "${FAULT_TYPES:-f3_missing_task_id f4_repeated_execution f4_truncated_result}"
 # read -r -a faults <<< "${FAULT_TYPES:-f1_unavailable}"
 export LOCUST_USERS="${LOCUST_USERS:-64}"

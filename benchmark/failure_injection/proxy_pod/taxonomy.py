@@ -54,6 +54,7 @@ _PERSISTENCE_GATE: Dict[Persistence, Dict[str, Any]] = {
 class Match:
     """Match requests by all specified conditions."""
     upstream: Optional[str] = None
+    source_service: Optional[str] = None
     methods: List[str] = field(default_factory=list)
     path_prefix: Optional[str] = None
     path_regex: Optional[str] = None
@@ -66,6 +67,7 @@ class Match:
         d = d or {}
         return Match(
             upstream=d.get("upstream"),
+            source_service=d.get("source_service"),
             methods=[m.upper() for m in d.get("methods", [])],
             path_prefix=d.get("path_prefix"),
             path_regex=d.get("path_regex"),

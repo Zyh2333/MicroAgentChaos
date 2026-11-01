@@ -55,6 +55,7 @@ data:
       min_count: 1
       match:
         upstream: qwen
+        source_service: agent-network-excel-parsing
         methods:
         - POST
         path_regex: /chat/completions$

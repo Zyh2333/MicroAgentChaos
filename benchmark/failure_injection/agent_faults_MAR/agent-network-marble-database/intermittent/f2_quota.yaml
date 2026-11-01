@@ -54,6 +54,7 @@ data:
       recovery: config
       match:
         upstream: qwen
+        source_service: agent-network-marble-database
         methods:
         - POST
         path_regex: /chat/completions$

@@ -54,6 +54,7 @@ data:
       recovery: config
       match:
         upstream: qwen
+        source_service: agent-network-pdf-parsing
         methods:
         - POST
         path_regex: /chat/completions$

@@ -56,6 +56,7 @@ data:
       max_count: 2
       match:
         upstream: qwen
+        source_service: agent-network-marble-werewolf
         methods:
         - POST
         path_regex: /chat/completions$
