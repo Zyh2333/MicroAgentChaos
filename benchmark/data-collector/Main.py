@@ -97,7 +97,7 @@ if __name__ == "__main__":
             return group_name
         return os.path.join(rel, group_name)
 
-    def collect_for_config(config, namespaces):
+    def collect_for_config(config, namespaces, merge_live_subdir=None):
         """Collect metrics for the complete window in config."""
         # Proxy fault records live in chaos/emptyDir, outside agent-network stdout.
         try:
@@ -115,6 +115,11 @@ if __name__ == "__main__":
             MetricCollector.collect(config, os.path.join(data_folder, 'metrics'), True)
             Trace.collect(config, os.path.join(data_folder, 'trace'))
             LogCollector.collect_logs_(config.start, config.end, n, os.path.join(data_folder, 'log'))
+            if merge_live_subdir:
+                LogCollector.merge_live_logs(
+                    os.path.join(data_folder, 'log'),
+                    os.path.join(data_folder, merge_live_subdir),
+                    config.start, config.end)
             # Log.collect(config, os.path.join(data_folder, 'log'))
             config.pods.clear()
             # Merge trace data into the original file when enabled.
@@ -173,6 +178,8 @@ if __name__ == "__main__":
     parser.add_argument('--merge-prefault', metavar='TMP_SUBDIR',
                         help='After final collection, merge logs of disappeared pods from the temporary snapshot '
                              'into log/ with the _log_prefault suffix, then remove the temporary directory')
+    parser.add_argument('--merge-live-logs', metavar='SUBDIR',
+                        help='Merge continuously captured service logs into the final log directory')
     cli_args, _ = parser.parse_known_args()
 
     if cli_args.user and cli_args.start and cli_args.end:
@@ -200,7 +207,7 @@ if __name__ == "__main__":
 
         print(f"==> Collecting one window [{config.start} ~ {config.end}] "
               f"({config.duration}s) -> data/{config.user}")
-        collect_for_config(config, namespaces)
+        collect_for_config(config, namespaces, cli_args.merge_live_logs)
         if cli_args.merge_prefault:
             merge_prefault_logs(config, namespaces, cli_args.merge_prefault)
         sys.exit(0)

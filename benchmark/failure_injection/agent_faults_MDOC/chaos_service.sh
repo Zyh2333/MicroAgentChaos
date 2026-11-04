@@ -8,6 +8,38 @@ usage() {
 }
 [[ $# -ge 1 ]] || usage
 service="$1"
+topology_mode="${TOPOLOGY_MODE:-dynamic}"
+case "$topology_mode" in
+  edge-preference)
+    [[ -z "${FAULT_ZONE:-}" || "$FAULT_ZONE" == edge ]] || { echo "edge-preference requires FAULT_ZONE=edge" >&2; exit 2; }
+    FAULT_ZONE=edge
+    ;;
+  cloud-preference)
+    [[ -z "${FAULT_ZONE:-}" || "$FAULT_ZONE" == cloud ]] || { echo "cloud-preference requires FAULT_ZONE=cloud" >&2; exit 2; }
+    FAULT_ZONE=cloud
+    ;;
+  dynamic) ;;
+  *) echo "TOPOLOGY_MODE must be edge-preference, cloud-preference, or dynamic" >&2; exit 2 ;;
+esac
+export TOPOLOGY_MODE="$topology_mode"
+case "${FAULT_ZONE:-}" in
+  "")
+    if [[ "$service" == *-edge ]]; then
+      fault_zone=edge
+    elif [[ "$topology_mode" == dynamic ]] && (( RANDOM % 2 )); then
+      fault_zone=edge
+    else
+      fault_zone=cloud
+    fi
+    ;;
+  cloud|edge) fault_zone="$FAULT_ZONE" ;;
+  *) echo "FAULT_ZONE must be cloud or edge" >&2; exit 2 ;;
+esac
+if [[ "$fault_zone" == edge ]]; then
+  [[ "$service" == *-edge ]] || service="${service}-edge"
+else
+  service="${service%-edge}"
+fi
 total_count="${2:-1}"
 [[ "$total_count" =~ ^[1-9][0-9]*$ ]] || usage
 if [[ $# -ge 2 ]]; then shift 2; else shift; fi
@@ -24,7 +56,15 @@ case "${INJECT_FAULT:-true}" in
 esac
 
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-deployments_file="${DEPLOYMENTS_FILE:-$dir/deployments.yaml}"
+if [[ -n "${DEPLOYMENTS_FILE:-}" ]]; then
+  deployments_file="$DEPLOYMENTS_FILE"
+else
+  case "$topology_mode" in
+    edge-preference) deployments_file="$dir/deployment-edge-preference.yaml" ;;
+    cloud-preference) deployments_file="$dir/deployment-cloud-preference.yaml" ;;
+    dynamic) deployments_file="$dir/deployments.yaml" ;;
+  esac
+fi
 case "$(basename "$dir")" in
   agent_faults_MAR) dataset=MARBLEBench; default_locustfile="$dir/../locustfile_agent_faults.py" ;;
   agent_faults_MDOC) dataset=MDOC; default_locustfile="$dir/../locustfile_agent_faults.py" ;;
@@ -66,9 +106,23 @@ locust_stop_timeout="${LOCUST_STOP_TIMEOUT:-600}"
 [[ "$locust_stop_timeout" =~ ^[1-9][0-9]*$ ]] || { echo "LOCUST_STOP_TIMEOUT must be a positive integer" >&2; exit 2; }
 if [[ -n "${LOCUST_HOST:-}" ]]; then
   locust_host="$LOCUST_HOST"
+elif [[ "$topology_mode" == dynamic && -n "${AGENT_FAULT_PLANNER_HOSTS:-}" && -z "${HOST_IP:-}" ]]; then
+  locust_host="${AGENT_FAULT_PLANNER_HOSTS%%,*}"
 else
   [[ -n "${HOST_IP:-}" ]] || { echo "set LOCUST_HOST or HOST_IP" >&2; exit 2; }
-  locust_host="http://${HOST_IP}:${PLANNER_NODEPORT:-31882}"
+  if [[ "$fault_zone" == edge ]]; then planner_nodeport=31883; else planner_nodeport=31882; fi
+  locust_host="http://${HOST_IP}:${PLANNER_NODEPORT:-$planner_nodeport}"
+fi
+planner_hosts=""
+if [[ "$topology_mode" == dynamic ]]; then
+  if [[ -n "${AGENT_FAULT_PLANNER_HOSTS:-}" ]]; then
+    planner_hosts="$AGENT_FAULT_PLANNER_HOSTS"
+  elif [[ -n "${HOST_IP:-}" ]]; then
+    planner_hosts="http://${HOST_IP}:31882,http://${HOST_IP}:31883"
+  else
+    echo "dynamic mode requires HOST_IP or AGENT_FAULT_PLANNER_HOSTS for random planner entry" >&2
+    exit 2
+  fi
 fi
 if [[ "$inject_fault" == true ]]; then
   default_prefix="$dataset/agent_faults/abnormal/load-${locust_users}"
@@ -76,8 +130,8 @@ else
   default_prefix="$dataset/agent_faults/normal/load-${locust_users}"
 fi
 data_base_prefix="${DATA_PREFIX:-$default_prefix}"
-if [[ "$service" == common ]]; then
-  [[ "$data_base_prefix" == */common ]] || data_base_prefix="$data_base_prefix/common"
+if [[ "$service" == common || "$service" == common-edge ]]; then
+  [[ "$data_base_prefix" == */"$service" ]] || data_base_prefix="$data_base_prefix/$service"
 fi
 
 # Match the old MAR 20-minute window by default; unlike the old MDOC script,
@@ -93,8 +147,19 @@ done
 (( fault_seconds > 0 )) || { echo "FAULT_SECONDS must be positive" >&2; exit 2; }
 locust_run_seconds=$((pre_fault_seconds + fault_seconds + locust_stop_timeout + 120))
 manage_deployments="${MANAGE_DEPLOYMENTS:-true}"
+edge_tmp_dir="$repo_root/tmp"
+mkdir -p "$edge_tmp_dir"
+selected_deployments_file="$(mktemp "$edge_tmp_dir/agent-edge-selected.XXXXXX")"
+if ! edge_services="$("$python_bin" "$dir/../select_edge_deployments.py" \
+    "$deployments_file" "$service" "$(basename "$dir")" \
+    "$selected_deployments_file")"; then
+  rm -f "$selected_deployments_file"
+  exit 2
+fi
+deployments_file="$selected_deployments_file"
 
 locust_pid=""
+watcher_pid=""
 fault_active=false
 deployed=false
 proxy_deployed=false
@@ -108,6 +173,10 @@ cleanup() {
     kill -TERM "$locust_pid" 2>/dev/null || true
     wait "$locust_pid" 2>/dev/null || true
   fi
+  if [[ -n "$watcher_pid" ]]; then
+    kill -TERM "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+  fi
   if [[ "$proxy_deployed" == true ]]; then
     kubectl -n chaos delete deployment/fault-proxy service/fault-proxy configmap/fault-proxy-config \
       --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -115,6 +184,7 @@ cleanup() {
   if [[ "$deployed" == true && "$manage_deployments" == true ]]; then
     kubectl delete -f "$deployments_file" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  rm -f "$selected_deployments_file"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -126,12 +196,12 @@ phase() {
 
 wait_for_agent_deployments() {
   local run_id="$1" deployments deployment deadline remaining
-  deployments="$(kubectl -n agent-network get deployments -o name)"
+  deployments="$(kubectl -n agent-network get -f "$deployments_file" -o name)"
   [[ -n "$deployments" ]] || { echo "no Deployments found in agent-network" >&2; return 1; }
   deadline=$(( $(date +%s) + 600 ))
   phase "$run_id" "waiting for all agent-network Deployments to roll out"
   while IFS= read -r deployment; do
-    [[ -n "$deployment" ]] || continue
+    case "$deployment" in deployment.apps/*|deployment/*) ;; *) continue ;; esac
     remaining=$((deadline - $(date +%s)))
     if (( remaining <= 0 )); then
       echo "timed out waiting for all agent-network Deployments" >&2
@@ -142,7 +212,13 @@ wait_for_agent_deployments() {
 }
 
 run_window() {
-  local fault="$1" idx yaml="" mode="" proxy_manifest run_id user_dir data_dir task_log label_file aggregate_label_file label_entry data_prefix sample_parent sample_dir suffix latest_idx=0
+  local fault="$1" idx yaml="" mode="" proxy_manifest run_id user_dir data_dir task_log label_file aggregate_label_file label_entry data_prefix sample_parent sample_dir suffix latest_idx=0 sample_service label_fault_zone
+  sample_service="$service"
+  label_fault_zone="$fault_zone"
+  if [[ "$inject_fault" == false ]]; then
+    label_fault_zone=none
+    if [[ "$topology_mode" == dynamic ]]; then sample_service="${service%-edge}"; fi
+  fi
   data_prefix="$data_base_prefix"
   if [[ "$inject_fault" == true ]]; then
     mode="$(mode_for_fault "$fault")"
@@ -152,15 +228,15 @@ run_window() {
   proxy_manifest="${yaml:-$dir/../proxy_pod/deploy/k8s.yaml}"
   sample_parent="$benchmark_root/data/$data_prefix"
   mkdir -p "$sample_parent"
-  for sample_dir in "$sample_parent/${service}_${fault}_"*; do
+  for sample_dir in "$sample_parent/${sample_service}_${fault}_"*; do
     [[ -d "$sample_dir" ]] || continue
-    suffix="${sample_dir#"$sample_parent/${service}_${fault}_"}"
+    suffix="${sample_dir#"$sample_parent/${sample_service}_${fault}_"}"
     [[ "$suffix" =~ ^[0-9]+$ ]] || continue
     if (( 10#$suffix > latest_idx )); then latest_idx=$((10#$suffix)); fi
   done
   idx=$((latest_idx + 1))
   while :; do
-    run_id="${service}_${fault}_${idx}"
+    run_id="${sample_service}_${fault}_${idx}"
     user_dir="$data_prefix/$run_id"
     data_dir="$benchmark_root/data/$user_dir"
     if mkdir "$data_dir" 2>/dev/null; then break; fi
@@ -172,8 +248,15 @@ run_window() {
     return 1
   done
   task_log="$data_dir/task.log"
-  label_file="$benchmark_root/data/$data_prefix/${service}_label.txt"
-  aggregate_label_file="$benchmark_root/data/$data_base_prefix/${service}_label.txt"
+  {
+    echo "service: $sample_service"
+    echo "topology_mode: $topology_mode"
+    echo "task_indices: ${AGENT_FAULT_TASK_INDEX:-all}"
+    echo "planner_entry_hosts: ${planner_hosts:-$locust_host}"
+    echo "marble_sample_seed: ${MARBLE_SAMPLE_SEED:-unset}"
+  } > "$data_dir/task_selection.txt"
+  label_file="$benchmark_root/data/$data_prefix/${sample_service}_label.txt"
+  aggregate_label_file="$benchmark_root/data/$data_base_prefix/${sample_service}_label.txt"
 
   phase "$run_id" "applying fault-proxy manifest"
   proxy_deployed=true
@@ -186,6 +269,7 @@ run_window() {
   kubectl apply -f "$proxy_manifest"
   kubectl -n chaos rollout status deployment/fault-proxy --timeout=600s
   if [[ "$manage_deployments" == true ]]; then
+    phase "$run_id" "edge planner + $edge_services"
     kubectl apply -f "$deployments_file"
     deployed=true
   fi
@@ -198,12 +282,18 @@ run_window() {
 
   local ws_e ws_h ls_e ls_h fs_e fs_h fe_e fe_h lstop_e lstop_h we_e we_h
   ws_e="$(date +%s)"; ws_h="$(date +'%Y-%m-%d %H:%M:%S')"
+  "$python_bin" -u "$benchmark_root/data-collector/LiveLogCollector.py" \
+    --namespace agent-network --start "$ws_e" \
+    --output "$data_dir/agent-network/log_live" \
+    > "$data_dir/log_watcher.log" 2>&1 &
+  watcher_pid=$!
   phase "$run_id" "baseline ${baseline_seconds}s"
   sleep "$baseline_seconds"
 
   ls_e="$(date +%s)"; ls_h="$(date +'%Y-%m-%d %H:%M:%S')"
   phase "$run_id" "starting Locust; task log: $task_log"
-  AGENT_FAULT_DATASET="$dataset" FAULT_SERVICE="$service" locust -f "$locustfile" --host="$locust_host" --headless \
+  AGENT_FAULT_DATASET="$dataset" FAULT_SERVICE="$service" AGENT_FAULT_PLANNER_HOSTS="$planner_hosts" \
+    locust -f "$locustfile" --host="$locust_host" --headless \
     --only-summary -u "$locust_users" -r "$locust_spawn_rate" -t "${locust_run_seconds}s" \
     --stop-timeout "$locust_stop_timeout" \
     >> "$task_log" 2>&1 &
@@ -237,10 +327,19 @@ run_window() {
   phase "$run_id" "recovery ${recovery_seconds}s"
   sleep "$recovery_seconds"
   we_e="$(date +%s)"; we_h="$(date +'%Y-%m-%d %H:%M:%S')"
+  kill -TERM "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  watcher_pid=""
 
   label_entry="$({
     echo "=== $run_id ==="
-    echo "service:      $service"
+    echo "service:      $sample_service"
+    echo "fault_zone:   $label_fault_zone"
+    echo "topology_mode: $topology_mode"
+    echo "task_indices: ${AGENT_FAULT_TASK_INDEX:-all}"
+    echo "planner_entry_hosts: ${planner_hosts:-$locust_host}"
+    echo "marble_sample_seed: ${MARBLE_SAMPLE_SEED:-unset}"
+    echo "edge_services: $edge_services"
     echo "fault_type:   $fault"
     if [[ "$inject_fault" == true ]]; then echo "persistence:  $mode"; fi
     echo "fault_injection: $inject_fault"
@@ -276,7 +375,8 @@ run_window() {
 
   phase "$run_id" "collecting logs before proxy deletion"
   ( cd "$benchmark_root" && "$python_bin" "$collector" \
-      --user "$user_dir" --start "$ws_e" --end "$we_e" ) || \
+      --user "$user_dir" --start "$ws_e" --end "$we_e" \
+      --merge-live-logs log_live ) || \
       echo "warning: data collection failed for $run_id" >&2
 
   kubectl -n chaos delete deployment/fault-proxy service/fault-proxy configmap/fault-proxy-config \

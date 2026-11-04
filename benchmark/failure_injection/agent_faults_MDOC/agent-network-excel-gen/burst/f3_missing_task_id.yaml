@@ -27,7 +27,6 @@ data:
         agent-network-marble-werewolf: "http://agent-network-marble-werewolf.agent-network.svc.cluster.local:10207"
         agent-network-marble-minecraft: "http://agent-network-marble-minecraft.agent-network.svc.cluster.local:10206"
         agent-network-planner: "http://agent-network-planner.agent-network.svc.cluster.local:18082"
-        agent-network-summarizer: "http://agent-network-summarizer.agent-network.svc.cluster.local:18081"
         agent-network-csv-gen: "http://agent-network-csv-gen.agent-network.svc.cluster.local:10121"
         agent-network-direction: "http://agent-network-direction.agent-network.svc.cluster.local:10097"
         agent-network-excel-gen: "http://agent-network-excel-gen.agent-network.svc.cluster.local:10109"
@@ -54,6 +53,8 @@ data:
       recovery: retry
       match:
         upstream: agent-network-excel-gen
+        header_equals:
+          X-Agent-Target-Zone: cloud
         methods:
         - POST
         path_prefix: /service

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import heapq
 import json
 import math
 import os
 import re
+import shutil
+import signal
+import tempfile
 import time
 
 from kubernetes import client, config
@@ -31,8 +35,6 @@ def collect_logs(
 
     v1 = client.CoreV1Api()
 
-    start_rfc3339 = timestamp_to_rfc3339(start_timestamp)
-
     pods = v1.list_namespaced_pod(
         namespace=namespace
     ).items
@@ -47,6 +49,8 @@ def collect_logs(
     for pod in pods:
 
         pod_name = pod.metadata.name
+        statuses = (getattr(pod.status, "container_statuses", None) or []) if pod.status else []
+        restart_counts = {status.name: status.restart_count for status in statuses}
 
         containers = [
             c.name
@@ -58,85 +62,51 @@ def collect_logs(
             if container_name == "istio-proxy":
                 continue
 
-            output_file = os.path.join(
-                output_dir,
-                f"{pod_name}_{container_name}.log"
-            )
-
-            print(
-                f"Collecting: "
-                f"{pod_name}/{container_name}"
-            )
-
-            try:
-                since_seconds = max(
-                    1,
-                    int(time.time() - start_timestamp)
+            # Kubernetes returns only the current container by default. A restart
+            # hides its predecessor unless previous=True is collected separately.
+            for previous in (False, True):
+                if previous and restart_counts.get(container_name, 0) < 1:
+                    continue
+                suffix = "_previous" if previous else ""
+                output_file = os.path.join(
+                    output_dir, f"{pod_name}_{container_name}{suffix}.log"
                 )
+                print(f"Collecting: {pod_name}/{container_name}{suffix}")
 
-                logs = v1.read_namespaced_pod_log(
-                    name=pod_name,
-                    namespace=namespace,
-                    container=container_name,
-                    timestamps=True,
-                    since_seconds=since_seconds,
-                    _preload_content=False,
-                )
+                try:
+                    since_seconds = max(1, math.ceil(time.time() - start_timestamp))
+                    logs = v1.read_namespaced_pod_log(
+                        name=pod_name,
+                        namespace=namespace,
+                        container=container_name,
+                        timestamps=True,
+                        since_seconds=since_seconds,
+                        previous=previous,
+                        _preload_content=False,
+                    )
 
-                with open(output_file, "w", encoding="utf-8") as f:
-
-                    for line in logs:
-                        if isinstance(line, bytes):
-                            line = line.decode("utf-8", errors="replace")
-
-                        line = line.rstrip("\n")
-
-                        if not line:
-                            continue
-
-                        try:
-                            # Kubernetes timestamps=True prefixes each log line with a timestamp:
-                            #
-                            # 2026-09-04T06:20:31.123456789Z log content
-                            #
-                            timestamp_str = line.split(" ", 1)[0]
-
-                            if timestamp_str.endswith("Z"):
-                                timestamp_str = timestamp_str[:-1] + "+00:00"
-
-                            # datetime.fromisoformat accepts at most microsecond precision.
-                            if "." in timestamp_str:
-                                main_part, fraction = timestamp_str.split(".", 1)
-
-                                # The fractional part may include a timezone offset:
-                                # 012475323+00:00
-                                fraction = fraction[:6]
-
-                                timestamp_str = f"{main_part}.{fraction}+00:00"
-
-                            log_dt = datetime.fromisoformat(timestamp_str)
-                            log_timestamp = log_dt.timestamp()
-
-                            # Stop once the requested window ends.
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        for line in logs:
+                            if isinstance(line, bytes):
+                                line = line.decode("utf-8", errors="replace")
+                            line = line.rstrip("\n")
+                            if not line:
+                                continue
+                            log_timestamp = _kube_log_time(line)
+                            if log_timestamp is None:
+                                continue
                             if log_timestamp > end_timestamp:
                                 break
+                            if log_timestamp >= start_timestamp:
+                                f.write(line + "\n")
 
-                            # since_seconds is approximate, so enforce the start bound here too.
-                            if log_timestamp < start_timestamp:
-                                continue
+                    # A restarted container may have no logs in this window.
+                    # Do not leave an empty previous-instance placeholder.
+                    if previous and os.path.getsize(output_file) == 0:
+                        os.unlink(output_file)
 
-                        except (ValueError, IndexError):
-                            # Skip lines without a parseable timestamp.
-                            continue
-
-                        f.write(line + "\n")
-
-            except client.exceptions.ApiException as e:
-                print(
-                    f"Failed: "
-                    f"{pod_name}/{container_name}: "
-                    f"{e}"
-                )
+                except client.exceptions.ApiException as e:
+                    print(f"Failed: {pod_name}/{container_name}{suffix}: {e}")
 
 
 def safe_filename(name):
@@ -154,6 +124,135 @@ def _kube_log_time(line):
         return datetime.fromisoformat(token.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def watch_logs(namespace, start_timestamp, output_dir, interval=5):
+    """Persist service logs during a run, including containers that restart.
+
+    Polling is used because a Kubernetes preStop hook does not run for crashes
+    or OOM kills. The final collector still fetches the last previous instance.
+    """
+    config.load_kube_config()
+    v1 = client.CoreV1Api()
+    os.makedirs(output_dir, exist_ok=True)
+    state = {}
+    stopping = False
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not stopping:
+        try:
+            pods = v1.list_namespaced_pod(namespace=namespace).items
+            for pod in pods:
+                statuses = (getattr(pod.status, "container_statuses", None) or []) if pod.status else []
+                restart_counts = {s.name: s.restart_count for s in statuses}
+                for container in pod.spec.containers:
+                    name = container.name
+                    if name == "istio-proxy":
+                        continue
+                    key = (pod.metadata.name, name)
+                    count = restart_counts.get(name, 0)
+                    # Start from the observed count: restarts before this watch
+                    # began are not restarts between its polls.
+                    item = state.setdefault(key, {"second": int(start_timestamp) - 1,
+                                                  "seen": set(), "restarts": count})
+                    if count > item["restarts"] + 1:
+                        print(f"WARNING: {key} restarted {count - item['restarts']} times between polls; "
+                              "older container logs may be unavailable", flush=True)
+                    # Read the previous instance first, before advancing the
+                    # watermark with lines from the new current instance.
+                    for previous in (True, False):
+                        if previous and count < 1:
+                            continue
+                        since = max(int(start_timestamp), item["second"] - 1)
+                        try:
+                            response = v1.read_namespaced_pod_log(
+                                name=key[0], namespace=namespace, container=name,
+                                timestamps=True,
+                                since_seconds=max(1, math.ceil(time.time() - since)),
+                                previous=previous, _preload_content=False,
+                            )
+                            try:
+                                path = os.path.join(output_dir, f"{key[0]}_{name}.log")
+                                with open(path, "a", encoding="utf-8") as out:
+                                    for raw in response:
+                                        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                                        line = line.rstrip("\n")
+                                        ts = _kube_log_time(line)
+                                        if ts is None or ts < start_timestamp:
+                                            continue
+                                        second = int(ts)
+                                        if second < item["second"]:
+                                            continue
+                                        if second > item["second"]:
+                                            item["second"] = second
+                                            item["seen"].clear()
+                                        if line not in item["seen"]:
+                                            out.write(line + "\n")
+                                            item["seen"].add(line)
+                            finally:
+                                response.close()
+                        except client.exceptions.ApiException as exc:
+                            print(f"WARNING: log poll failed for {key} previous={previous}: {exc}", flush=True)
+                    item["restarts"] = count
+        except Exception as exc:
+            print(f"WARNING: log watch scan failed: {exc}", flush=True)
+        if not stopping:
+            time.sleep(interval)
+
+
+def merge_live_logs(final_dir, live_dir, start_timestamp=None, end_timestamp=None):
+    """Merge the run-time snapshot and final current/previous logs by timestamp."""
+    has_live_dir = os.path.isdir(live_dir)
+    if not has_live_dir:
+        print(f"WARNING: live log directory is missing: {live_dir}")
+    os.makedirs(final_dir, exist_ok=True)
+    names = {name for name in os.listdir(live_dir) if name.endswith(".log")} if has_live_dir else set()
+    names.update(f"{name[:-13]}.log" for name in os.listdir(final_dir)
+                 if name.endswith("_previous.log"))
+    for name in sorted(names):
+        canonical = os.path.join(final_dir, name)
+        previous = os.path.join(final_dir, f"{name[:-4]}_previous.log")
+        sources = [path for path in (os.path.join(live_dir, name), canonical, previous)
+                   if os.path.isfile(path)]
+        if not sources:
+            continue
+        fd, tmp = tempfile.mkstemp(prefix=".log-merge-", dir=final_dir, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                handles = [open(path, encoding="utf-8") for path in sources]
+                try:
+                    lines = heapq.merge(*handles, key=lambda line: _kube_log_time(line) or 0)
+                    last_second = None
+                    seen = set()
+                    for line in lines:
+                        ts = _kube_log_time(line)
+                        if ts is None:
+                            continue
+                        if start_timestamp is not None and ts < start_timestamp:
+                            continue
+                        if end_timestamp is not None and ts > end_timestamp:
+                            continue
+                        second = int(ts)
+                        if second != last_second:
+                            last_second = second
+                            seen.clear()
+                        if line not in seen:
+                            out.write(line)
+                            seen.add(line)
+                finally:
+                    for handle in handles:
+                        handle.close()
+            os.replace(tmp, canonical)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    if has_live_dir:
+        shutil.rmtree(live_dir)
 
 
 def collect_proxy_logs(start_timestamp, end_timestamp, output_dir):

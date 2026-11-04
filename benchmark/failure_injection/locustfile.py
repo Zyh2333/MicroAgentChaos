@@ -138,8 +138,8 @@ class MDOCUser(HttpUser):
             # NATCM planning-related image (orig: ...W020230506781423338851.jpg)
             "http://192.168.31.15:12104/api/sys/storage/file/download?fileName=aW1hZ2Vfb2NyXzQuanBlZw&user=exp",
 
-            # Environment and agent perception architecture diagram
-            "http://192.168.31.15:12104/api/sys/storage/file/download?fileName=Q2hhdEdQVCBJbWFnZSAyMDI25bm0N-aciDE15pelIDE3XzM0XzQwLnBuZw&user=exp"
+            # # Environment and agent perception architecture diagram
+            # "http://192.168.31.15:12104/api/sys/storage/file/download?fileName=Q2hhdEdQVCBJbWFnZSAyMDI25bm0N-aciDE15pelIDE3XzM0XzQwLnBuZw&user=exp"
         ],
 
         # Complex images - charts / PNG / JPG etc.
