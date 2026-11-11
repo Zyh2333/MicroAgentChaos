@@ -125,6 +125,13 @@ class ProxyFaultEngine:
             cur = ctx.header(hk)
             if cur is None or not re.search(hv, cur):
                 return False
+        if m.header_expression is not None:
+            left_name, operator, right_name = m.header_expression
+            left, right = ctx.header(left_name), ctx.header(right_name)
+            if left is None or right is None:
+                return False
+            if (left == right) != (operator == "=="):
+                return False
         for path, expect in m.body_equals.items():
             if jp_get(body, path) != expect:
                 return False
@@ -350,7 +357,9 @@ class ProxyFaultEngine:
             "response_body_bytes": ctx.response_body_bytes if rule.stage == "response" else None,
             "routing_headers": {name: value for name in (
                 "X-Upstream", "X-Upstream-Url", "X-Agent-Service", "X-Agent-Target-Zone",
-                "X-Agent-Degrade-Stage", "X-Forwarded-For")
+                "X-Agent-Degrade-Stage", "X-Forwarded-For", "X-Agent-Source-Zone", "X-TaskId", "X-Agent-Graph-Id", "X-Agent-Source-Url", "X-Agent-Vertex", "X-Agent-Service-Group", 
+                "X-Agent-Subtask-Id", "X-Caller-Metadata",
+                "X-Callee-Metadata")
                 if (value := ctx.header(name)) is not None},
             "effective_probability": rule.eff_probability,
             "effective_max_count": rule.eff_max_count,

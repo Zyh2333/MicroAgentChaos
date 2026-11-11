@@ -89,7 +89,7 @@ def faults_for_service(folder: str, service: str, runtime: dict) -> list[str]:
     else:
         faults = [item for item in re.split(r"[\s,]+", raw.strip()) if item]
     if not faults or len(faults) != len(set(faults)) or any(
-        not re.fullmatch(r"f[1-4]_[a-z0-9_]+", item) for item in faults
+        not re.fullmatch(r"f[0-4]_[a-z0-9_]+", item) for item in faults
     ):
         raise ValueError("FAULT_TYPES must contain distinct valid fault names")
     return faults
@@ -292,7 +292,7 @@ def reconcile_progress(plan: dict, run_dir: Path, progress: dict) -> dict:
                 for sample in parent.iterdir():
                     if not sample.is_dir() or sample.name not in labeled:
                         continue
-                    match = re.fullmatch(rf"{re.escape(name)}_(f[1-4]_[a-z0-9_]+|normal)_(\d+)", sample.name)
+                    match = re.fullmatch(rf"{re.escape(name)}_(f[0-4]_[a-z0-9_]+|normal)_(\d+)", sample.name)
                     if not match or not (sample / "task.log").is_file() or not (
                         sample / "agent-network/graph/call_chains.json").is_file():
                         continue

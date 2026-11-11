@@ -4,7 +4,7 @@ set -euo pipefail
 export TOPOLOGY_MODE="${TOPOLOGY_MODE:-dynamic}"
 service="common"
 total_count="${SAMPLES_PER_FAULT:-1}"
-read -r -a faults <<< "${FAULT_TYPES:-f1_slow f1_network_drop f2_auth f2_quota f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result}"
+read -r -a faults <<< "${FAULT_TYPES:-f0_cross_zone_disconnect f0_cross_zone_packet_loss f1_unavailable f1_slow f1_network_drop f2_auth f2_quota f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result}"
 # read -r -a faults <<< "${FAULT_TYPES:-f1_unavailable f1_slow f1_network_drop f2_auth f2_quota f3_missing_task_id f3_response_drop f4_repeated_execution f4_truncated_result}"
 # read -r -a faults <<< "${FAULT_TYPES:-f3_response_drop}"
 export LOCUST_USERS="${LOCUST_USERS:-64}"

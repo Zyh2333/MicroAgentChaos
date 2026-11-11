@@ -52,7 +52,7 @@ data:
       propagation: cross_task
       recovery: restart
       min_count: 1
-      max_count: 11
+      max_count: 51
       match:
         upstream: qwen
         source_service: agent-network-pdf-gen-edge

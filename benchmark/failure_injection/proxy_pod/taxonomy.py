@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import sys
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
 class Category(str, Enum):
+    F0_INFRA = "F0_cloud_edge_infrastructure"
     F1_RUNTIME = "F1_runtime_env"
     F2_SHARED_DEP = "F2_shared_dep_config"
     F3_INTERFACE = "F3_service_interface"
@@ -60,11 +62,21 @@ class Match:
     path_regex: Optional[str] = None
     header_equals: Dict[str, str] = field(default_factory=dict)
     header_regex: Dict[str, str] = field(default_factory=dict)
+    header_expression: Optional[tuple[str, str, str]] = None
     body_equals: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def from_dict(d: Optional[dict]) -> "Match":
         d = d or {}
+        expression = d.get("header_expression")
+        parsed_expression = None
+        if expression is not None:
+            if not isinstance(expression, str):
+                raise ValueError("header_expression 必须是两个请求头的比较表达式")
+            parsed = re.fullmatch(r"\s*([A-Za-z][A-Za-z0-9-]*)\s*(==|!=)\s*([A-Za-z][A-Za-z0-9-]*)\s*", expression)
+            if parsed is None:
+                raise ValueError("header_expression 仅支持 'Header-A == Header-B' 或 'Header-A != Header-B'")
+            parsed_expression = parsed.groups()
         return Match(
             upstream=d.get("upstream"),
             source_service=d.get("source_service"),
@@ -73,6 +85,7 @@ class Match:
             path_regex=d.get("path_regex"),
             header_equals={k: str(v) for k, v in (d.get("header_equals") or {}).items()},
             header_regex={k: str(v) for k, v in (d.get("header_regex") or {}).items()},
+            header_expression=parsed_expression,
             body_equals=dict(d.get("body_equals") or {}),
         )
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <service> [samples_per_fault] [f1_unavailable ... f4_truncated_result]" >&2
+  echo "usage: $0 <service> [samples_per_fault] [f0_cross_zone_disconnect ... f4_truncated_result]" >&2
   exit 2
 }
 [[ $# -ge 1 ]] || usage
@@ -80,7 +80,7 @@ mode_for_fault() {
     return
   fi
   case "$1" in
-    f1_network_drop|f3_response_drop) echo intermittent ;;
+    f0_cross_zone_packet_loss|f1_network_drop|f3_response_drop) echo intermittent ;;
     f4_no_tool_calls|f4_truncated_result) echo single ;;
     *) echo persistent ;;
   esac
@@ -88,7 +88,7 @@ mode_for_fault() {
 if [[ "$inject_fault" == true ]]; then
   for fault in "${fault_types[@]}"; do
     mode="$(mode_for_fault "$fault")"
-    [[ "$fault" =~ ^f[1-4]_[a-z0-9_]+$ && -f "$dir/$service/$mode/$fault.yaml" ]] || {
+    [[ "$fault" =~ ^f[0-4]_[a-z0-9_]+$ && -f "$dir/$service/$mode/$fault.yaml" ]] || {
       echo "missing/invalid fault YAML: $dir/$service/$mode/$fault.yaml" >&2; exit 2;
     }
   done
