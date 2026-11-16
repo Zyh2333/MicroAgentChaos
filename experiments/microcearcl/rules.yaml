@@ -1,0 +1,62 @@
+# MicroCEARCL 故障域规则注册表。
+# r1-r4 是 R 支持规则；cf1 是 CF 必要性签名；c1-c2 是对照规则。
+# 新增层级/类型只需修改本文件；程序不内置层名或规则文本。
+version: 1
+# 这些类型区分请求丢弃与响应丢弃，诊断时必须附 compare_presence 跨端对照。
+boundary_types: [network_drop, response_drop]
+layers:
+  - id: F0
+    name: 基础设施与区域网络
+    types: [cross_zone_disconnect, cross_zone_packet_loss]
+    rules:
+      r1: 跨 Zone 通信异常
+      r2: 多个目标服务受影响（非必要）
+      r3: 多任务类型受影响（非必要）
+      r4: 多执行路径受影响（非必要）
+      cf1: 若 F0 为根因，必须出现跨 Zone 异常或跨区调用失败
+      c1: 同服务同任务跨区/同区对照
+      c2: 匹配纯云/云边对照
+  - id: F1
+    name: 服务运行环境与服务入口边界
+    types: [unavailable, slow, network_drop]
+    rules:
+      r1: Agent 入口 503 或请求阶段 504
+      r2: 不同调用方访问同服务失败
+      r3: 同区与跨区调用同服务失败
+      r4: 匹配基线服务处理延迟增加
+      cf1: 若 F1 为根因，必须出现 Agent 入口 503/504，或入口请求延迟抬升
+      c1: 同服务不同调用方对照
+      c2: 同调用方不同服务对照
+  - id: F2
+    name: 外部模型依赖
+    types: [auth, quota]
+    rules:
+      r1: 模型 endpoint 401
+      r2: 模型 endpoint 429
+      r3: 不同 Agent 同 endpoint 被拒绝
+      r4: 异常定位在模型访问边界
+      cf1: 若 F2 为根因，必须出现模型 endpoint 401 或 429
+      c1: 不同 Agent 同模型对照
+      c2: 调用/不调用模型任务对照
+  - id: F3
+    name: 接口交互与响应传递
+    types: [missing_task_id, response_drop]
+    rules:
+      r1: 契约要求的 taskId 缺失
+      r2: 上游执行而调用方 response 阶段 504
+      r3: 请求响应记录关联异常
+      r4: 同服务其他请求正常
+      cf1: 若 F3 为根因，必须出现 taskId 缺失，或上游已执行而调用方 response 阶段 504
+      c1: 接收/执行/响应/接收阶段对照
+      c2: 同服务正常/异常请求对照
+  - id: F4
+    name: 执行控制与结果完整性
+    types: [repeated_execution, truncated_result]
+    rules:
+      r1: 同任务同阶段响应重复
+      r2: 重复响应关联多个独立执行
+      r3: 原始/接收内容截断
+      r4: 模型访问成功而接收结果异常
+      cf1: 若 F4 为根因，必须出现重复模型响应或响应内容截断
+      c1: 原始/接收模型响应对照
+      c2: 响应/执行图精确关联

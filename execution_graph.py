@@ -694,7 +694,8 @@ def _parse_log_ts(token: str):
 
 def scan_service_logs(ns_dir: str, service: str, start=None, end=None,
                       cfg=None, max_snippets: int = 5,
-                      anomaly_type_union: Optional[Union[str, List[str]]] = None
+                      anomaly_type_union: Optional[Union[str, List[str]]] = None,
+                      line_filter=None
                       ) -> Dict:
     """Scan a service's container log(s) for normalized error signatures
     within [start, end]. The root-cause error text (e.g. 429 quota) lives in
@@ -712,8 +713,10 @@ def scan_service_logs(ns_dir: str, service: str, start=None, end=None,
         except Exception:
             continue
         with fh:
-            for line in fh:
+            for line_no, line in enumerate(fh, 1):
                 line = line.rstrip('\n')
+                if line_filter is not None:
+                    line = line_filter(line, f, line_no)
                 if not line:
                     continue
                 content = line

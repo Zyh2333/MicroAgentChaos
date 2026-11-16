@@ -1,0 +1,10 @@
+{
+  "provenance": "benchmark/failure_injection/CLOUD_EDGE_TOPOLOGY.md#节点区域",
+  "nodes": {
+    "node-15": {"zone": "cloud"},
+    "node-171": {"zone": "cloud"},
+    "node-227": {"zone": "cloud"},
+    "node-219": {"zone": "edge"},
+    "node-221": {"zone": "edge"}
+  }
+}
