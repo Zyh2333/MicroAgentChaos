@@ -370,6 +370,12 @@ class EvidenceGraph:
     def class_of(self, observation_id):
         return self.same.find(observation_id)
 
+    def class_degree(self, observation_id):
+        """Number of outgoing DEPENDENT neighbors of the observation's SAME class."""
+        if observation_id not in self.observations:
+            return 0
+        return len(self.dependent.get(self.same.find(observation_id), ()))
+
     def bundle_of(self, observation_id):
         return self.chain.find(observation_id)
 

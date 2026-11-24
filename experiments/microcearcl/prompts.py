@@ -109,4 +109,9 @@ def _compose(section=""):
 
 SYSTEM = _compose()
 GRAPH_SYSTEM = _compose(GRAPH_STATE_SECTION)
+GRAPH_CONTRIBUTION_SYSTEM = _compose(GRAPH_STATE_SECTION + """
+- 在 contribution 视图中，support、related、independent 列出证据 ID，正文和元数据在 graph.evidence[id]。overview 中的 id 也引用这张表。
+- support 是该命题的已引用记录，是否支持必要性签名以 cf 状态为准。
+- related 是与该命题的引用同包的关联记录，用于查看执行链。
+- independent 是可用于核对该命题的独立观测。""")
 SYSTEM_WITH_EVIDENCE_GRAPH = _compose(EVIDENCE_GRAPH_SECTION)

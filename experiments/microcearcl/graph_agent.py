@@ -11,7 +11,7 @@ This agent pushes the evidence graph's semantic state into every round:
   controls for refutations, and the query ledger for redundancy;
 * Stage-1 submission uses the baseline's checkpoint unchanged: deadline or
   periodic after ``commit_every`` rounds without a commit, regardless of graph
-  activity.  Commit cadence uses the baseline's checkpoint.
+  activity.
 
 The model keeps the part it is uniquely good at: deciding what a record means and
 which rule it supports.  Stage 2 keeps the baseline protocol untouched.  The pull
@@ -24,31 +24,43 @@ from copy import deepcopy
 
 from experiments.evidence_assoc import planner as graph_planner
 from experiments.evidence_assoc.adapters import claims_from_layers, expand_ids
+from experiments.evidence_assoc.evolution import (DEFAULT_COMBINATION_SIZE,
+                                                   DEFAULT_MAX_COMBINATIONS, ActivityLedger)
 from experiments.evidence_assoc.propositions import assess
-from experiments.evidence_assoc.view import graph_state
+from experiments.evidence_assoc.view import graph_state, summary
 
 from .agent import CounterfactualAgent, _frame
-from .prompts import GRAPH_SYSTEM
+from .prompts import GRAPH_CONTRIBUTION_SYSTEM, GRAPH_SYSTEM
 from .registry import DIAGNOSES, READERS, SUBMITS, Registry
 from .rules import LAYERS, counterfactuals, controls as layer_controls, rule_lookup
 from .utils import worklist
 from .utils.background_noise import POLICY, policy as background_policy
 from .utils.conversation_log import error_info, timestamp
 from .utils.evidence_graph import EvidenceGraphBridge
+from .utils import finish_layer_stage
 from .utils.finish_diagnosis import ValidationErrors, salvage
-from .utils.finish_layer_stage import run as finish_layer_stage
 from .utils.process_response import run as process_response
+from .utils.context_projection import project_messages
 from .utils.transcript_budget import bounded, size as json_size
 
 
 class CounterfactualGraphAgent(CounterfactualAgent):
     def __init__(self, backend, max_rounds=32, max_tool_calls=100, degree_budget=6,
-                 commit_every=5, graph_event_sink=None):
+                 commit_every=5, graph_event_sink=None, state_view="semantic",
+                 state_budget=12000, project_transcript=False, context_budget=24000,
+                 m2_combination_size=DEFAULT_COMBINATION_SIZE,
+                 m2_max_combinations=DEFAULT_MAX_COMBINATIONS):
         super().__init__(backend, max_rounds=max_rounds, max_tool_calls=max_tool_calls,
                          commit_every=commit_every, evidence_graph=True,
                          evidence_degree_budget=degree_budget,
                          graph_event_sink=graph_event_sink)
-        self.prompt = GRAPH_SYSTEM
+        self.prompt = GRAPH_CONTRIBUTION_SYSTEM if state_view == "contribution" else GRAPH_SYSTEM
+        self.state_view = state_view
+        self.state_budget = state_budget
+        self.m2_combination_size = m2_combination_size
+        self.m2_max_combinations = m2_max_combinations
+        self.project_transcript = project_transcript
+        self.context_budget = context_budget
 
     # ------------------------------------------------------------------ graph
     def _graph(self):
@@ -66,17 +78,32 @@ class CounterfactualGraphAgent(CounterfactualAgent):
     def _state(self, round_no):
         """Semantic digest of the open propositions, pushed every round."""
         graph = self._graph()
-        # Excluded/unsupported layers keep their citations in the assessment log
-        # and stay out of the open proposition set.
+        # Parked, excluded and unsupported layers keep their citations in the ledger.
         open_layers = {layer: record for layer, record in self.assessments.items()
                        if (record or {}).get("state") not in
-                       ("excluded", "unsupported", "skipped")}
+                       worklist.NONBLOCKING_STATES}
         claims, _ = claims_from_layers(open_layers, graph)
-        return graph_state(
-            assess(graph, claims), graph, self.assessments,
+        propositions = assess(graph, claims)
+        cf_rules = {layer: list(counterfactuals(layer)) for layer in LAYERS}
+        control_rules = {layer: list(layer_controls(layer)) for layer in LAYERS}
+        ranked = self.activity.ranked_propositions(
+            propositions, rule_text=rule_lookup(), cf_rules=cf_rules,
+            control_rules=control_rules)
+        selection = None
+        if self.state_view == "contribution":
+            selection = self.activity.select(
+                ranked, graph, budget=self.state_budget,
+                combination_size=self.m2_combination_size,
+                max_combinations=self.m2_max_combinations)
+        state = graph_state(
+            propositions, graph, self.assessments,
             rule_text=rule_lookup(), layers=LAYERS, round_no=round_no,
-            cf_rules={layer: list(counterfactuals(layer)) for layer in LAYERS},
-            control_rules={layer: list(layer_controls(layer)) for layer in LAYERS})
+            cf_rules=cf_rules, control_rules=control_rules,
+            selection=selection, include_ids=True)
+        state["state_view"] = self.state_view
+        state["activity"] = self.activity.refresh(
+            state, graph, propositions=ranked, selection=selection, round_no=round_no)
+        return state
 
     def _graph_fingerprint(self):
         graph = self._graph()
@@ -161,12 +188,74 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                 errors.append({**error, "layer": assessment.get("layer")})
         return errors
 
+    def _sync_evidence_graph(self, name):
+        """Ingest the call's records and feed fresh ids to the activity ledger."""
+        super()._sync_evidence_graph(name)
+        activity = getattr(self, "activity", None)
+        if self.evidence_graph is None or activity is None:
+            return
+        fresh = getattr(self.evidence_graph, "last_fresh_ids", None)
+        if fresh:
+            activity.on_new_observation(fresh)
+
+    def _evidence_summary(self, evidence_id):
+        observation = self._graph().observations.get(evidence_id)
+        return summary(observation, 160) if observation is not None else None
+
+    @staticmethod
+    def _collect_evidence(value):
+        found = []
+
+        def walk(item):
+            if isinstance(item, dict):
+                token = item.get("evidence_id")
+                if isinstance(token, str):
+                    found.append(token)
+                for child in item.values():
+                    walk(child)
+            elif isinstance(item, list):
+                for child in item:
+                    walk(child)
+
+        walk(value)
+        return found
+
+    def _evidence_ids_of(self, value):
+        graph = self._graph()
+        ids = []
+        for token in self._collect_evidence(value):
+            if token in graph.observations and token not in ids:
+                ids.append(token)
+        return ids
+
+    def _request_messages(self):
+        """Full transcript or its bounded projection, plus projection stats."""
+        if not self.project_transcript:
+            return self.messages, {}
+        keep_from = self._round_starts[-2] if len(self._round_starts) >= 2 else 0
+        projected, stats = project_messages(
+            self.messages, self.activity.states, self._call_evidence,
+            summarize=self._evidence_summary, budget=self.context_budget,
+            keep_from=keep_from)
+        if stats["after_chars"] > self.context_budget:
+            current = self._round_starts[-1] if self._round_starts else len(self.messages)
+            projected, stats = project_messages(
+                self.messages, self.activity.states, self._call_evidence,
+                summarize=self._evidence_summary, budget=self.context_budget,
+                keep_from=current, max_evidence=2, summary_chars=60)
+        return projected, stats
+
     def _result(self, termination, started):
         value = super()._result(termination, started)
         value["state_log"] = deepcopy(self.state_log)
-        value["state_view"] = "semantic"
+        value["state_view"] = self.state_view
         value["stalled_rounds"] = self.stalled_rounds
         value["current_state"] = self.last_state
+        value["activity_log"] = deepcopy(self.activity.activity_log)
+        value["reactivation_log"] = deepcopy(self.activity.reactivation_log)
+        value["selection_stats"] = (self.activity.last_selection.summary()
+                                    if self.activity.last_selection is not None else None)
+        value["projection_stats"] = deepcopy(self.projection_log)
         return value
 
     # ------------------------------------------------------------------- loop
@@ -189,12 +278,19 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                               "redundant_queries": 0, "stalled_rounds": 0,
                               "state_changed_rounds": 0,
                               "evidence_edges_retracted": 0,
-                              "support_edges_retracted": 0}
+                              "support_edges_retracted": 0,
+                              "active_evidence": 0, "dormant_evidence": 0,
+                              "archived_evidence": 0, "reactivated": 0,
+                              "projected_messages": 0, "projected_chars": 0}
         self.evidence_graph = EvidenceGraphBridge(
             sample, degree_budget=self.evidence_degree_budget,
             event_sink=self.graph_event_sink,
             context=lambda: (self.round_no, self.stage))
         self.ledger = graph_planner.QueryLedger()
+        self.activity = ActivityLedger()
+        self.projection_log = []
+        self._call_evidence = {}
+        self._round_starts = []
         self.state_log, self.last_state = [], None
         self.stalled_rounds = 0
         self._last_state = {}
@@ -211,8 +307,14 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                                                 "policy": POLICY},
                               "max_rounds": self.max_rounds, "max_tool_calls": self.max_tool_calls,
                               "commit_every": self.commit_every,
-                              "state_view": "semantic",
+                              "state_view": self.state_view,
+                              "state_budget": self.state_budget,
+                              "project_transcript": self.project_transcript,
+                              "context_budget": self.context_budget,
                               "prompt_sha256": hashlib.sha256(self.prompt.encode()).hexdigest()}
+        if self.state_view == "contribution":
+            self.configuration.update(m2_combination_size=self.m2_combination_size,
+                                      m2_max_combinations=self.m2_max_combinations)
         self.messages = [{"role": "system", "content": self.prompt},
                          {"role": "user", "content": json.dumps({
                              "request": "由证据图引导，逐步补足证据并提交两阶段诊断。",
@@ -239,9 +341,15 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             before_fingerprint = self._graph_fingerprint()
             before_signature = self._state_signature()
 
+            self._round_starts.append(len(self.messages))
             state = self._state(round_no)
             self.last_state = state
             self.state_log.append({"round": round_no, "stage": self.stage, "state": state})
+            activity = state.get("activity") or {}
+            self.context_stats["active_evidence"] = activity.get("active", 0)
+            self.context_stats["dormant_evidence"] = activity.get("dormant", 0)
+            self.context_stats["archived_evidence"] = activity.get("archived", 0)
+            self.context_stats["reactivated"] += len(activity.get("reactivated") or ())
             if self.stage == 1:
                 checkpoint_reason = self._stage1_checkpoint(round_no)
                 if checkpoint_reason:
@@ -290,12 +398,22 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             parameters = (self.backend.request_parameters()
                           if hasattr(self.backend, "request_parameters")
                           else {"model": self.backend.model})
-            request = {**parameters, "message_count": len(self.messages),
-                       "messages_sha256": self._message_hasher.copy().hexdigest(),
+            request_messages, projection = self._request_messages()
+            request = {**parameters, "message_count": len(request_messages),
+                       "messages_sha256": hashlib.sha256(
+                           json.dumps(request_messages, ensure_ascii=False).encode()).hexdigest(),
                        "tool_count": len(tools or []),
                        "tools_sha256": hashlib.sha256(
                            json.dumps(tools or [], ensure_ascii=False,
                                       sort_keys=True).encode()).hexdigest()}
+            if projection:
+                request["projection"] = {key: projection[key] for key in
+                                         ("tool_folded", "notices_folded",
+                                          "before_chars", "after_chars", "budget")}
+                self.projection_log.append({"round": round_no, **projection})
+                self.context_stats["projected_messages"] += (
+                    projection["tool_folded"] + projection["notices_folded"])
+                self.context_stats["projected_chars"] = projection["after_chars"]
             exchange = {"round": round_no, "stage": self.stage, "started_at": timestamp(),
                         "configuration": deepcopy(self.configuration), "request": request,
                         "status": "pending"}
@@ -305,7 +423,7 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             self._emit("llm_request", exchange)
             self._save("running")
             try:
-                message, metadata = self.backend.complete(self.messages, tools)
+                message, metadata = self.backend.complete(request_messages, tools)
             except Exception as exc:
                 exchange.update(status="backend_error", error=error_info(exc),
                                 finished_at=timestamp())
@@ -428,6 +546,8 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                               "note": "数据工具失败；此结果不支持排除"}
                     entry.update(status="error", error_type=type(exc).__name__)
                 entry["result"] = output
+                if name in READERS:
+                    self._call_evidence[call["id"]] = self._evidence_ids_of(output)
                 original = json_size(output)
                 if isinstance(output, dict) and output.get("duplicate_of"):
                     self.context_stats["duplicate_queries"] += 1

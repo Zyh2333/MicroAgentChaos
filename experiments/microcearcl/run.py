@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+from experiments.evidence_assoc.evolution import DEFAULT_COMBINATION_SIZE, DEFAULT_MAX_COMBINATIONS
 import results_log
 from agent_rca import _service_rank
 from .agent import CounterfactualAgent
@@ -119,7 +120,15 @@ def run_batch(args, backend_factory=None):
                         backend, args.max_rounds, args.max_tool_calls,
                         degree_budget=getattr(args, "evidence_degree_budget", 6),
                         commit_every=args.commit_every,
-                        graph_event_sink=graph_events.write)
+                        graph_event_sink=graph_events.write,
+                        state_view=getattr(args, "state_view", "semantic"),
+                        state_budget=getattr(args, "state_budget", 12000),
+                        project_transcript=getattr(args, "project_transcript", False),
+                        context_budget=getattr(args, "context_budget", 24000),
+                        m2_combination_size=getattr(args, "m2_combination_size",
+                                                    DEFAULT_COMBINATION_SIZE),
+                        m2_max_combinations=getattr(args, "m2_max_combinations",
+                                                     DEFAULT_MAX_COMBINATIONS))
                 else:
                     agent = CounterfactualAgent(
                         backend, args.max_rounds, args.max_tool_calls,
@@ -140,10 +149,15 @@ def run_batch(args, backend_factory=None):
                 result = agent.diagnose(sample, checkpoint=checkpoint, event_sink=conversation.emit)
             except Exception as exc:
                 error = type(exc).__name__
-                conversation.emit("execution_error", {"error": error_info(exc)})
+                details = error_info(exc, include_traceback=True)
+                conversation.emit("execution_error", {"error": details})
                 if artifact.is_file():
                     result = json.loads(artifact.read_text(encoding="utf-8"))
                 result["termination"] = "execution_error"
+                result["execution_error"] = details
+                location = details["traceback"][-1]
+                print(f"[error] {error} at {location['file']}:{location['line']} "
+                      f"in {location['function']} (see conversation log)", flush=True)
                 read_seconds = time.perf_counter() - started
             # Evaluation metadata is attached only after the agent returns.
             # A budget-exhausted run may still carry a salvaged last ordering.
@@ -246,6 +260,19 @@ def parser():
                     help="只读证据图：额外暴露 read_evidence_graph 工具与对应提示词；不改变诊断协议")
     ap.add_argument("--evidence-degree-budget", type=int, default=6,
                     help="证据图中每个观测允许的最大 DEPENDENT 度数；超出降级为 UNKNOWN")
+    ap.add_argument("--state-view", choices=("semantic", "contribution"), default="semantic",
+                    help="graph agent 的证据状态：semantic=固定上限语义视图；"
+                         "contribution=按边际贡献字典序填充")
+    ap.add_argument("--state-budget", type=int, default=12000,
+                    help="contribution 模式下每轮证据摘要的字符预算 B_t")
+    ap.add_argument("--m2-combination-size", type=int, default=DEFAULT_COMBINATION_SIZE,
+                    help="contribution 模式下每次反事实删除的证据数（默认 %(default)s）")
+    ap.add_argument("--m2-max-combinations", type=int, default=DEFAULT_MAX_COMBINATIONS,
+                    help="contribution 模式下每轮最多检验的组合数（默认 %(default)s）")
+    ap.add_argument("--project-transcript", action=argparse.BooleanOptionalAction, default=False,
+                    help="实验选项，默认关闭；将历史工具结果折叠为证据引用，待 M3 假设验证接入后再评估")
+    ap.add_argument("--context-budget", type=int, default=24000,
+                    help="transcript 投影后的字符预算")
     ap.add_argument("--mask-csv-gen-auth", action=argparse.BooleanOptionalAction, default=True,
                     help="保留已知 csv-gen 数据污染屏蔽；不作为通用诊断分类规则")
     ap.add_argument("--tag")
@@ -261,6 +288,8 @@ def main():
         ap.error("预算和 timeout 必须大于零")
     if args.commit_every < 0:
         ap.error("--commit-every 不能为负数（0 表示关闭周期检查点）")
+    if args.m2_combination_size < 1 or args.m2_max_combinations < 1:
+        ap.error("--m2-combination-size 和 --m2-max-combinations 必须为正整数")
     if args.limit is not None and args.limit <= 0:
         ap.error("--limit 必须大于零")
     if args.tag and (Path(args.tag).name != args.tag or args.tag in (".", "..")):

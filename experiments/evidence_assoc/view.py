@@ -30,6 +30,7 @@ DEFAULT_SUMMARY_CHARS = 1000
 DEFAULT_MAX_BUNDLES = 10
 DEFAULT_MAX_SIGNALS = 5
 DEFAULT_MAX_PRODUCERS = 5
+EVIDENCE_ROLES = ("support", "related", "independent")
 
 # ------------------------------------------------------------------ summaries
 def _first_line(text):
@@ -61,6 +62,11 @@ def _excerpt(observation, limit):
     return text
 
 
+def summary(observation, limit=DEFAULT_SUMMARY_CHARS):
+    """Public one-line summary used by the transcript projection."""
+    return _excerpt(observation, limit)
+
+
 def _stamp_label(value):
     try:
         return datetime.fromtimestamp(value, timezone.utc).strftime("%m-%d %H:%M:%S")
@@ -84,7 +90,7 @@ def _time_span_label(observations):
     return start if end in (None, start) else f"{start}–{end}"
 
 
-def _producer_label(observation):
+def producer_label(observation):
     """Who emitted the record, or ``None`` when provenance cannot say.
 
     Only a ``<pod>_<container>.log`` reference or a provenance-derived entity
@@ -104,7 +110,7 @@ def _record(observation, relation, bundle, summary_chars, copies=1):
     row = {"id": observation.id, "rel": relation, "bundle": bundle,
            "time": _time_label(observation),
            "summary": _excerpt(observation, summary_chars)}
-    producer = _producer_label(observation)
+    producer = producer_label(observation)
     if producer:
         row["producer"] = producer
     if copies > 1:
@@ -113,9 +119,12 @@ def _record(observation, relation, bundle, summary_chars, copies=1):
 
 
 # -------------------------------------------------------------------- support
-def _support_records(proposition, graph, class_sizes, bundle_sizes, bundle_labels,
-                     max_records, summary_chars):
-    """Cited records, one per SAME class, ordered along the chain."""
+def support_representatives(proposition, graph):
+    """One observation per SAME class, in citation order.
+
+    Returns ``(items, duplicates)`` where each item is
+    ``(observation, class_root, bundle_root)``.
+    """
     seen, items, duplicates = set(), [], 0
     for evidence_id in proposition.evidence_ids:
         observation = graph.observations.get(evidence_id)
@@ -126,25 +135,37 @@ def _support_records(proposition, graph, class_sizes, bundle_sizes, bundle_label
             duplicates += 1
             continue
         seen.add(class_root)
-        bundle_root = graph.bundle_of(evidence_id)
-        if class_sizes.get(class_root, 1) > 1:
-            relation = "same"
-        elif bundle_sizes.get(bundle_root, 1) > 1:
-            relation = "dependent"
-        else:
-            relation = "single"
+        items.append((observation, class_root, graph.bundle_of(evidence_id)))
+    return items, duplicates
+
+
+def relation_label(class_root, bundle_root, class_sizes, bundle_sizes):
+    if class_sizes.get(class_root, 1) > 1:
+        return "same"
+    if bundle_sizes.get(bundle_root, 1) > 1:
+        return "dependent"
+    return "single"
+
+
+def _support_records(proposition, graph, class_sizes, bundle_sizes, bundle_labels,
+                     max_records, summary_chars):
+    """Cited records, one per SAME class, ordered along the chain."""
+    items, duplicates = support_representatives(proposition, graph)
+    rows = []
+    for observation, class_root, bundle_root in items:
         start = observation.features.span[0] if observation.features.span else float("inf")
-        copies = class_sizes.get(class_root, 1)
-        items.append((start, observation, relation, bundle_root, copies))
-    items.sort(key=lambda item: (item[0], item[1].id))
-    shown = items[:max_records]
-    records = [_record(observation, relation, bundle_labels.get(bundle_root),
-                       summary_chars, copies)
-               for _, observation, relation, bundle_root, copies in shown]
-    return records, duplicates, max(0, len(items) - len(shown))
+        rows.append((start, observation, class_root, bundle_root))
+    rows.sort(key=lambda item: (item[0], item[1].id))
+    shown = rows[:max_records]
+    records = [_record(observation,
+                       relation_label(class_root, bundle_root, class_sizes, bundle_sizes),
+                       bundle_labels.get(bundle_root), summary_chars,
+                       class_sizes.get(class_root, 1))
+               for _, observation, class_root, bundle_root in shown]
+    return records, duplicates, max(0, len(rows) - len(shown))
 
 
-def _independent_adjacency(graph):
+def independent_adjacency(graph):
     """INDEPENDENT edges as an adjacency map, built once per view."""
     adjacency = defaultdict(list)
     for edge in graph.edges.values():
@@ -165,13 +186,13 @@ def _text_hints(observation):
     return hints
 
 
-def _independent_records(proposition, graph, adjacency, bundle_labels,
-                         max_independent, summary_chars):
-    """Independent neighbours that share a semantic anchor with the support.
+def independent_candidates(proposition, graph, adjacency):
+    """INDEPENDENT neighbours that share a semantic anchor with the support.
 
     An INDEPENDENT edge means "a different producer, not the same execution";
     it does not mean "about the same thing".  Without a shared text entity or
     template the neighbour would be an unrelated record, so it is omitted.
+    Returns ``(confidence, observation)`` ordered by confidence then id.
     """
     support_ids = set(proposition.evidence_ids)
     support_hints = set()
@@ -190,16 +211,21 @@ def _independent_records(proposition, graph, adjacency, bundle_labels,
             if observation is None or not (_text_hints(observation) & support_hints):
                 continue
             found[other] = (confidence, observation)
-    ordered = sorted(found.values(), key=lambda item: (-item[0], item[1].id))
+    return sorted(found.values(), key=lambda item: (-item[0], item[1].id))
+
+
+def _independent_records(proposition, graph, adjacency, bundle_labels,
+                         max_independent, summary_chars):
+    order = independent_candidates(proposition, graph, adjacency)
     return [_record(observation, "independent",
                     bundle_labels.get(graph.bundle_of(observation.id)), summary_chars)
-            for _, observation in ordered[:max_independent]]
+            for _, observation in order[:max_independent]]
 
 
 # ------------------------------------------------------------------- overview
 def _overview(graph, bundle_sizes, bundle_labels, max_bundles, max_signals,
-              max_producers, summary_chars):
-    """Semantic summary for rounds before any layer verdict exists."""
+              max_producers, summary_chars, include_ids=True, inline_samples=True):
+    """Summarize the graph, with inline samples or evidence table references."""
     top_roots = sorted(bundle_sizes,
                        key=lambda root: (-bundle_sizes[root], root))[:max_bundles]
     top_set = set(top_roots)
@@ -210,7 +236,7 @@ def _overview(graph, bundle_sizes, bundle_labels, max_bundles, max_signals,
         root = graph.bundle_of(observation.id)
         if root in top_set:
             members[root].append(observation)
-        producer = _producer_label(observation)
+        producer = producer_label(observation)
         if producer:
             producer_counts[producer] += 1
         status = observation.features.status
@@ -221,8 +247,12 @@ def _overview(graph, bundle_sizes, bundle_labels, max_bundles, max_signals,
             entry = errors.get(key)
             if entry is None:
                 entry = {"source": source, "status": status, "exception": exception,
-                         "records": 0, "time": _time_label(observation),
-                         "sample": _excerpt(observation, summary_chars)}
+                         "records": 0,
+                         "time": _time_label(observation)}
+                if inline_samples:
+                    entry["sample"] = _excerpt(observation, summary_chars)
+                if include_ids:
+                    entry["id"] = observation.id
                 errors[key] = entry
             entry["records"] += 1
 
@@ -233,11 +263,19 @@ def _overview(graph, bundle_sizes, bundle_labels, max_bundles, max_signals,
             continue
         rows.sort(key=lambda row: (row.features.span[0] if row.features.span else float("inf"),
                                    row.id))
-        bundles.append({"bundle": bundle_labels.get(root),
-                        "size": bundle_sizes[root],
-                        "producers": sorted({_producer_label(row) for row in rows})[:4],
-                        "time": _time_span_label(rows),
-                        "sample": _excerpt(rows[0], summary_chars)})
+        # Missing provenance is valid (e.g. a graph record joined to a log).
+        # Keep its evidence in the bundle, but only sort known producer names.
+        producer_names = {producer_label(row) for row in rows}
+        producer_names.discard(None)
+        bundle_row = {"bundle": bundle_labels.get(root),
+                      "size": bundle_sizes[root],
+                      "producers": sorted(producer_names)[:4],
+                      "time": _time_span_label(rows)}
+        if inline_samples:
+            bundle_row["sample"] = _excerpt(rows[0], summary_chars)
+        if include_ids:
+            bundle_row["id"] = rows[0].id
+        bundles.append(bundle_row)
     signals = sorted(errors.values(),
                      key=lambda row: (-row["records"], row["source"]))[:max_signals]
     producers_rows = [{"producer": name, "records": count}
@@ -333,31 +371,8 @@ def _claim_text(rule, rule_text):
     return rule.replace(":", " ")
 
 
-def graph_state(propositions, graph, assessments=None, rule_text=None,
-                layers=None, round_no=None,
-                cf_rules=None, control_rules=None,
-                max_propositions=DEFAULT_MAX_PROPOSITIONS,
-                max_records=DEFAULT_MAX_RECORDS,
-                max_independent=DEFAULT_MAX_INDEPENDENT,
-                max_bundles=DEFAULT_MAX_BUNDLES,
-                max_signals=DEFAULT_MAX_SIGNALS,
-                max_producers=DEFAULT_MAX_PRODUCERS,
-                summary_chars=DEFAULT_SUMMARY_CHARS):
-    """Render open propositions as a bounded semantic digest.
-
-    ``cf_rules``/``control_rules`` map a layer to its expected rule ids.  A
-    supported rule stays ``investigate`` while the layer's CF is unknown; a
-    valid CF veto closes it; C controls only matter when several layers compete.
-    ``assessments``/``layers`` only report layers that have not been assessed.
-    """
-    class_sizes = Counter()
-    bundle_sizes = Counter()
-    for observation_id in graph.observations:
-        class_sizes[graph.class_of(observation_id)] += 1
-        bundle_sizes[graph.bundle_of(observation_id)] += 1
-    ordered_roots = sorted(bundle_sizes, key=lambda root: (-bundle_sizes[root], root))
-    bundle_labels = {root: f"B{index}" for index, root in enumerate(ordered_roots, 1)}
-    adjacency = _independent_adjacency(graph)
+def evaluate_propositions(propositions, rule_text=None, cf_rules=None, control_rules=None):
+    """Rank propositions by action, CF gap, unresolved state and bundle count."""
     rule_text = rule_text or {}
     cf_rules = cf_rules or {}
     control_rules = control_rules or {}
@@ -393,15 +408,85 @@ def graph_state(propositions, graph, assessments=None, rule_text=None,
                 -proposition.bundles, -len(proposition.evidence_ids), proposition.rule)
         evaluated.append((rank, proposition, cf_status, control_status,
                           action, open_text))
-
     evaluated.sort(key=lambda item: item[0])
+    return evaluated
+
+
+def graph_state(propositions, graph, assessments=None, rule_text=None,
+                layers=None, round_no=None,
+                cf_rules=None, control_rules=None,
+                max_propositions=DEFAULT_MAX_PROPOSITIONS,
+                max_records=DEFAULT_MAX_RECORDS,
+                max_independent=DEFAULT_MAX_INDEPENDENT,
+                max_bundles=DEFAULT_MAX_BUNDLES,
+                max_signals=DEFAULT_MAX_SIGNALS,
+                max_producers=DEFAULT_MAX_PRODUCERS,
+                summary_chars=DEFAULT_SUMMARY_CHARS,
+                selection=None, include_ids=True):
+    """Render open propositions as a bounded semantic digest.
+
+    ``cf_rules``/``control_rules`` map a layer to its expected rule ids.  A
+    supported rule stays ``investigate`` while the layer's CF is unknown; a
+    valid CF veto closes it; C controls only matter when several layers compete.
+    ``assessments``/``layers`` only report layers that have not been assessed.
+
+    With ``selection``, proposition roles and overview samples refer to
+    ``state["evidence"]`` by id. Selected evidence is listed in ranked order.
+    ``None`` renders inline records with the fixed per-rule caps.
+    """
+    class_sizes = Counter()
+    bundle_sizes = Counter()
+    for observation_id in graph.observations:
+        class_sizes[graph.class_of(observation_id)] += 1
+        bundle_sizes[graph.bundle_of(observation_id)] += 1
+    ordered_roots = sorted(bundle_sizes, key=lambda root: (-bundle_sizes[root], root))
+    bundle_labels = {root: f"B{index}" for index, root in enumerate(ordered_roots, 1)}
+    adjacency = independent_adjacency(graph) if selection is None else None
+    rule_text = rule_text or {}
+
+    evidence = {}
+
+    def add_evidence(evidence_id):
+        if evidence_id not in evidence:
+            observation = graph.observations[evidence_id]
+            class_root = graph.class_of(evidence_id)
+            bundle_root = graph.bundle_of(evidence_id)
+            record = _record(observation,
+                             relation_label(class_root, bundle_root, class_sizes, bundle_sizes),
+                             bundle_labels[bundle_root], summary_chars,
+                             class_sizes[class_root])
+            del record["id"]
+            evidence[evidence_id] = record
+
+    evaluated = evaluate_propositions(propositions, rule_text, cf_rules, control_rules)
     rows = []
     for _, proposition, cf_status, control_status, action, open_text in evaluated[:max_propositions]:
-        support, duplicates, omitted = _support_records(
-            proposition, graph, class_sizes, bundle_sizes, bundle_labels,
-            max_records, summary_chars)
-        independent = _independent_records(
-            proposition, graph, adjacency, bundle_labels, max_independent, summary_chars)
+        if selection is None:
+            support, duplicates, omitted = _support_records(
+                proposition, graph, class_sizes, bundle_sizes, bundle_labels,
+                max_records, summary_chars)
+            independent = _independent_records(
+                proposition, graph, adjacency, bundle_labels, max_independent, summary_chars)
+            references = {"support": support, "independent": independent}
+            reading = _reading(proposition, support, duplicates, independent)
+        else:
+            chosen = selection.by_rule.get(proposition.rule) or {}
+            references = {
+                role: [evidence_id for evidence_id in chosen.get(role, ())
+                       if evidence_id in graph.observations]
+                for role in EVIDENCE_ROLES
+            }
+            for ids in references.values():
+                for evidence_id in ids:
+                    add_evidence(evidence_id)
+            items, duplicates = support_representatives(proposition, graph)
+            visible = set(references["support"])
+            omitted = sum(1 for observation, _, _ in items
+                          if observation.id not in visible)
+            support = [evidence[evidence_id] for evidence_id in references["support"]]
+            reading = _reading(proposition, support, duplicates, references["independent"])
+            if omitted and not support:
+                reading = f"本轮未展示已引用记录（{omitted} 条去重引用）。"
         row = {"rule": proposition.rule,
                "claim": _claim_text(proposition.rule, rule_text),
                "layer": proposition.layer,
@@ -410,9 +495,8 @@ def graph_state(propositions, graph, assessments=None, rule_text=None,
                "cf": cf_status,
                "controls": control_status,
                "bundles": proposition.bundles,
-               "support": support,
-               "independent": independent,
-               "graph_reading": _reading(proposition, support, duplicates, independent),
+               **references,
+               "graph_reading": reading,
                "open": open_text}
         if omitted:
             row["omitted"] = omitted
@@ -423,11 +507,21 @@ def graph_state(propositions, graph, assessments=None, rule_text=None,
              "propositions": rows}
     # Before any proposition carries records, the model still needs the graph's
     # concrete content: largest bundles, error signals and main producers.
-    if not any(row["support"] for row in rows) and graph.observations:
+    if not any(row["support"] or row.get("related") for row in rows) and graph.observations:
         overview = _overview(graph, bundle_sizes, bundle_labels, max_bundles,
-                             max_signals, max_producers, summary_chars)
+                             max_signals, max_producers, summary_chars,
+                             include_ids=include_ids or selection is not None,
+                             inline_samples=selection is None)
         if overview["largest_bundles"] or overview["error_signals"] or overview["top_producers"]:
             state["overview"] = overview
+            if selection is not None:
+                for group in ("largest_bundles", "error_signals"):
+                    for sample in overview[group]:
+                        add_evidence(sample["id"])
+    if selection is not None:
+        evidence_order = dict.fromkeys([*selection.active, *evidence])
+        state["evidence"] = {evidence_id: evidence[evidence_id]
+                             for evidence_id in evidence_order if evidence_id in evidence}
     if round_no is not None:
         state = {"round": round_no, **state}
     if assessments is not None and layers:

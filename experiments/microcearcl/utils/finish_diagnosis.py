@@ -42,7 +42,7 @@ def _unexplained_reason(states):
               for state in states.values()]
     if all(state == 'excluded' for state in values):
         return 'OutOfTaxonomy'
-    if all(state == 'unsupported' for state in values):
+    if all(state in ('unsupported', 'unresolved') for state in values):
         return 'InsufficientSupport'
     return 'Mixed'
 
@@ -81,9 +81,9 @@ def run(agent, args):
     not_candidate = [x for x in order if x not in candidates]
     if not_candidate:
         errors.append(_error(
-            'layer_order_not_candidate', 'layer_order 只能包含 candidate 层；excluded/unsupported 不能排序',
+            'layer_order_not_candidate', 'layer_order 只能包含有支持的 candidate 层',
             field='layer_order', layers=not_candidate, candidates=candidates,
-            excluded_layers=excluded, unsupported_layers=unsupported))
+            excluded_layers=excluded, unsupported_layers=unsupported, parked_layers=parked))
 
     diagnoses = args.get('diagnoses')
     if not isinstance(diagnoses, list):

@@ -42,6 +42,7 @@ class EvidenceGraphBridge:
                                      topology=self._topology())
         self.ingested = set()
         self.last_sync = 0
+        self.last_fresh_ids = []
         if event_sink is not None:
             self.associator.graph.observe(self._graph_event)
 
@@ -77,6 +78,7 @@ class EvidenceGraphBridge:
 
     def sync(self, evidence, tool=None):
         """Ingest evidence records registered since the last sync."""
+        self.last_fresh_ids = []
         fresh = {}
         for evidence_id, fact in (evidence or {}).items():
             if evidence_id in self.ingested or not isinstance(fact, dict):
@@ -93,6 +95,7 @@ class EvidenceGraphBridge:
         self.associator.ingest(rows)
         self.associator.resolve()
         self.last_sync = len(rows)
+        self.last_fresh_ids = sorted(fresh)
         self._emit_sync(len(rows), fresh)
         return len(rows)
 

@@ -4,8 +4,8 @@ A submission is a delta.  Omitted fields keep their previous value, so a
 CF-only round never wipes support and a support-only round never resurrects a
 vetoed layer.  Support is trivalent, mirroring CF: ``present`` (R evidence),
 ``absent`` (confirmed no support, coverage + control required) and ``unknown``
-(probed but unconfirmed).  Confirmed absence and a CF veto close the layer;
-``unknown`` keeps it visible as parked without satisfying Gate 1.
+(probed but unconfirmed). Confirmed absence and a CF veto close the layer;
+``unknown`` maps to an unresolved, parked layer without satisfying Gate 1.
 """
 from copy import deepcopy
 
@@ -17,7 +17,13 @@ from .observation_evidence import raw_fact
 NAME = 'assess_layer'
 CF_STATES = ('present', 'absent', 'unknown')
 SUPPORT_STATES = ('present', 'absent', 'unknown')
-LAYER_STATES = ('unsubmitted', 'candidate', 'unsupported', 'excluded', 'skipped')
+LAYER_STATES = ('unsubmitted', 'candidate', 'unresolved', 'unsupported', 'excluded', 'skipped')
+_LAYER_STATE_BY_SUPPORT = {
+    'unsubmitted': 'unsubmitted',
+    'present': 'candidate',
+    'unknown': 'unresolved',
+    'absent': 'unsupported',
+}
 
 
 def blank(layer, state='unsubmitted'):
@@ -218,14 +224,7 @@ def run(agent, args):
     supported_rules = sorted({entry['rule_id'] for entry in merged_support})
     has_support = support_state == 'present'
 
-    if veto_by or prior.get('state') == 'excluded':
-        state = 'excluded'
-    elif support_state == 'unsubmitted':
-        state = 'unsubmitted'
-    elif has_support:
-        state = 'candidate'
-    else:
-        state = 'unsupported'
+    state = 'excluded' if veto_by else _LAYER_STATE_BY_SUPPORT[support_state]
 
     optional_rules = ([rule for rule in predictions(layer) if rule not in supported_rules]
                       if state in ('candidate',) or support_state == 'unknown' else [])
@@ -240,7 +239,7 @@ def run(agent, args):
         'supported_rules': supported_rules, 'cached_rules': supported_rules,
         'optional_rules': optional_rules, 'support_state': support_state,
         'support_confirmed': support_state in ('present', 'absent'),
-        'parked': support_state == 'unknown', 'support_coverage_ids': coverage,
+        'parked': state == 'unresolved', 'support_coverage_ids': coverage,
         'weak_conflict': has_support and bool(merged_contradictions),
         'support_at_veto': has_support and state == 'excluded',
         'cf_gaps': [gap for entry in cf for gap in entry['gaps']],

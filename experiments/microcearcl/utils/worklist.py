@@ -8,7 +8,8 @@ layer's R rules become optional strengthening, and C controls never block.
 from ..rules import LAYERS, controls, counterfactuals, predictions
 
 REQUIRED_READERS = ('read_metrics', 'read_logs', 'read_execution_graph')
-CLOSED_STATES = ('excluded', 'unsupported', 'skipped')
+# Unresolved layers remain optional, like previously parked unsupported layers.
+NONBLOCKING_STATES = ('excluded', 'unsupported', 'skipped', 'unresolved')
 
 
 def record(assessments, layer):
@@ -45,7 +46,7 @@ def required(assessments, skip_unsubmitted=False):
     for layer in LAYERS:
         current = record(assessments, layer)
         state = current.get('state')
-        if state in CLOSED_STATES:
+        if state in NONBLOCKING_STATES:
             continue
         if state in (None, 'unsubmitted'):
             if not skip_unsubmitted:
@@ -123,11 +124,11 @@ def effects(before, after):
     for layer in LAYERS:
         old = before.get(layer) or {}
         new = after.get(layer) or {}
-        if new.get('state') in ('excluded', 'unsupported') and old.get('state') != new.get('state'):
+        state = new.get('state')
+        confirmed_absent = state == 'unsupported' and not new.get('parked')
+        if (state == 'excluded' or confirmed_absent) and old.get('state') != state:
             pruned.append(layer)
-            reasons[layer] = ('CF veto' if new.get('state') == 'excluded'
-                              else 'confirmed absent' if new.get('support_confirmed')
-                              else 'not found yet (parked, unconfirmed)')
+            reasons[layer] = 'CF veto' if state == 'excluded' else 'confirmed absent'
             closed.extend(predictions(layer) + counterfactuals(layer) + controls(layer))
         if new.get('state') == 'candidate' and old.get('state') != 'candidate':
             cached.extend(new.get('supported_rules', []))

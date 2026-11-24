@@ -23,13 +23,24 @@ def safe_endpoint(value):
     return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
-def error_info(error):
+def error_info(error, *, include_traceback=False):
     # SDK error strings can contain headers/payloads; retain structured identity.
     result = {"type": type(error).__name__}
     for name in ("status_code", "request_id"):
         value = getattr(error, name, None)
         if isinstance(value, (str, int)):
             result[name] = value
+    if include_traceback:
+        # Locations suffice to locate local failures. Do not log exception text,
+        # source lines or locals: SDK payloads and credentials may appear there.
+        frames = []
+        tb = error.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            frames.append({"file": code.co_filename, "line": tb.tb_lineno,
+                           "function": code.co_name})
+            tb = tb.tb_next
+        result["traceback"] = frames
     return result
 
 
