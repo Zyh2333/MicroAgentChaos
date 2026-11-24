@@ -1,6 +1,6 @@
 """Check evidence availability for a layer hypothesis without classifying log text."""
 from ..rules import LAYERS, counterfactuals, predictions, rule_lookup
-from .evidence_ids import expand
+from .evidence_ids import OBSERVATION, expand, records_for
 from .observation_evidence import raw_fact
 
 PARAMETERS = {
@@ -29,6 +29,12 @@ def _recent_records(registry, stage, limit=8):
 def _rows(registry, ids, stage, field='evidence_ids'):
     if not isinstance(ids, list) or any(not isinstance(eid, str) for eid in ids):
         raise ValueError('证据字段必须为记录 ID 数组')
+    # A tool-level id whose result carried no records is not expandable; name the
+    # real problem instead of telling the model to try a different record id.
+    for eid in ids:
+        if OBSERVATION.match(eid) and not records_for(registry, eid, stage):
+            raise ValueError(f'{eid} 没有返回任何记录（该工具结果为空），不能作为证据；'
+                             f'请引用具体记录 ID，或换一个查询。')
     ids, _ = expand(ids, set(), field, registry=registry, stage=stage)
     rows = []
     for eid in ids:

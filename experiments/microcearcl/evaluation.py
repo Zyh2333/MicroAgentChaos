@@ -1,4 +1,6 @@
 """Two distinct target dimensions; all ranking formulas reuse MicroARCL helpers."""
+import statistics
+
 from eval_utils import _topk_metrics
 
 from .rules import LAYERS
@@ -11,6 +13,31 @@ def ranking_metrics(rows, dimension):
     return {"n": len(eligible), "ACC@K": acc, "AVG@N": avg,
             "MRR": sum(1 / r[key] for r in eligible if r.get(key, 0) > 0) / len(eligible) if eligible else None,
             "top1_accuracy": acc[1] if eligible else None}
+
+
+def token_metrics(rows):
+    """Aggregate per-sample ``token_usage``; missing usage is ignored."""
+    usage = [r.get("token_usage") or {} for r in rows]
+
+    def values(key):
+        return [u[key] for u in usage if isinstance(u.get(key), (int, float))]
+
+    result = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                "cached_tokens", "uncached_prompt_tokens", "reasoning_tokens",
+                "max_prompt_tokens", "rounds", "usage_rounds", "tool_calls"):
+        found = values(key)
+        result[key] = ({"sum": sum(found), "mean": statistics.mean(found),
+                        "median": statistics.median(found)} if found else None)
+    totals = values("total_tokens")
+    usage_rounds = values("usage_rounds")
+    calls = values("tool_calls")
+    result["tokens_per_round"] = (round(sum(totals) / sum(usage_rounds))
+                                  if totals and sum(usage_rounds) else None)
+    result["tokens_per_tool_call"] = (round(sum(totals) / sum(calls))
+                                      if totals and sum(calls) else None)
+    result["samples"] = len(totals)
+    return result
 
 
 def evaluate(rows, breakdowns=True):
@@ -41,6 +68,7 @@ def evaluate(rows, breakdowns=True):
             "insufficient_support": sum(r.get("unexplained_reason") == "InsufficientSupport" for r in rows),
             "candidates_unranked": sum(r.get("unexplained_reason") == "CandidatesUnranked" for r in rows),
             "salvaged": sum(bool(r.get("salvaged")) for r in rows),
+            "token_usage": token_metrics(rows),
             "unlabeled_layers": len(rows) - len(labeled), "unlabeled_types": len(rows) - len(typed)}
     if breakdowns:
         result["breakdowns"] = {field: {value: evaluate([r for r in rows if r.get(field, "") == value], False)

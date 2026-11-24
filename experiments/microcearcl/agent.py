@@ -4,9 +4,10 @@ import hashlib
 import time
 from copy import deepcopy
 from .registry import Registry, CHECKS, DIAGNOSES, SUBMITS
-from .prompts import SYSTEM
+from .prompts import SYSTEM, SYSTEM_WITH_EVIDENCE_GRAPH
 from .rules import LAYERS, controls, counterfactuals, predictions
 from .utils import worklist
+from .utils.evidence_graph import EvidenceGraphBridge
 from .utils.observation_summary import READERS
 from .utils.process_response import run as process_response
 from .utils.finish_diagnosis import ValidationErrors, salvage
@@ -44,16 +45,30 @@ def resident_mb():
 
 
 class CounterfactualAgent:
-    def __init__(self, backend, max_rounds=32, max_tool_calls=100, commit_every=5):
+    def __init__(self, backend, max_rounds=32, max_tool_calls=100, commit_every=5,
+                 evidence_graph=False, evidence_degree_budget=6, graph_event_sink=None):
         self.backend = backend
+        # Optional differential log sink for graph evolution (observational).
+        self.graph_event_sink = graph_event_sink
+        self.round_no = 0
         self.max_rounds = max_rounds
         self.max_tool_calls = max_tool_calls
         # A submit checkpoint is forced once this many rounds pass without a
         # Stage-1 commit.  0 disables periodic checkpoints (the end-game force
         # still applies).
         self.commit_every = commit_every
+        # Advisory evidence graph: read-only view over records already read.
+        self.evidence_graph_enabled = bool(evidence_graph)
+        self.evidence_degree_budget = evidence_degree_budget
+        self.prompt = SYSTEM_WITH_EVIDENCE_GRAPH if self.evidence_graph_enabled else SYSTEM
+        self._reset_token_stats()
 
     def diagnose(self, sample, checkpoint=None, event_sink=None):
+        self.evidence_graph = (EvidenceGraphBridge(
+            sample, degree_budget=self.evidence_degree_budget,
+            event_sink=self.graph_event_sink,
+            context=lambda: (self.round_no, self.stage))
+            if self.evidence_graph_enabled else None)
         self.registry = Registry(sample)
         self.registry.agent = self
         self.assessments, self.verified = {}, set()
@@ -64,11 +79,13 @@ class CounterfactualAgent:
         self.observations, self.read_seconds = {}, 0.0
         self.peak_rss_mb = 0.0
         self.pruning_log, self.max_prompt_tokens, self.stage_two_round = [], 0, None
+        self._reset_token_stats()
         self.committed, self.stage_one_commits, self.last_commit_round = False, 0, 0
         self.context_stats = {'tool_result_chars': 0, 'sent_tool_chars': 0,
                               'truncations': 0, 'duplicate_queries': 0,
                               'compacted_results': 0, 'submit_checkpoints': 0,
-                              'diagnosis_submissions': 0}
+                              'diagnosis_submissions': 0, 'evidence_graph_syncs': 0,
+                              'evidence_graph_observations': 0}
         self._checkpoint_callback, self._event_sink = checkpoint, event_sink
         self.started = time.perf_counter()
         backend_config = (self.backend.configuration() if hasattr(self.backend, "configuration")
@@ -78,8 +95,10 @@ class CounterfactualAgent:
                               "input_filters": {"mask_csv_gen_auth": sample.mask_csv_gen_auth, "policy": POLICY},
                               "max_rounds": self.max_rounds, "max_tool_calls": self.max_tool_calls,
                               "commit_every": self.commit_every,
-                              "prompt_sha256": hashlib.sha256(SYSTEM.encode()).hexdigest()}
-        self.messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": json.dumps({
+                              "evidence_graph": self.evidence_graph_enabled,
+                              "evidence_degree_budget": self.evidence_degree_budget,
+                              "prompt_sha256": hashlib.sha256(self.prompt.encode()).hexdigest()}
+        self.messages = [{"role": "system", "content": self.prompt}, {"role": "user", "content": json.dumps({
             "request": "检测异常，进行反事实验证与两阶段诊断。", "services": sample.cache.get("services", []),
             "modalities": {"metrics": sample.ns("metrics").is_dir(), "logs": sample.ns("log").is_dir(),
                            "execution_graph": sample.ns("graph").is_dir()},
@@ -93,23 +112,15 @@ class CounterfactualAgent:
         self._save("running")
         calls = 0
         for round_no in range(1, self.max_rounds + 1):
+            self.round_no = round_no
             # Reserve the last round for a submission: stage 2 gets no tools and
             # one explicit chance to return the final JSON.
             final_submit = self.stage == 2 and round_no == self.max_rounds
-            # An exploration-only run never reaches Stage 2.  Near the budget,
-            # revoke data tools when the previous round did not commit a delta.
-            stage1_force = (self.stage == 1 and self.max_rounds >= 8
-                            and round_no >= self.max_rounds - 4
-                            and self.last_commit_round < round_no - 1)
-            # Periodic checkpoint: after N rounds without a Stage-1 commit,
-            # expose only submit_layer until one delta lands.  This replaces the
-            # old per-round "please commit next round" nudge.
-            needs_commit = bool(worklist.required(self.assessments))
-            periodic_checkpoint = (self.stage == 1 and self.commit_every > 0
-                                   and needs_commit
-                                   and round_no - self.last_commit_round >= self.commit_every)
-            checkpoint = (self.stage == 1 and needs_commit
-                          and (stage1_force or periodic_checkpoint))
+            # Stage-1 submission checkpoint: deadline near the budget, or periodic
+            # after N rounds without a commit.  Shared with the graph agent so a
+            # comparison changes the graph mechanism, not the commit cadence.
+            checkpoint_reason = self._stage1_checkpoint(round_no)
+            checkpoint = checkpoint_reason is not None
             if final_submit:
                 notice = {"role": "user", "content": (
                     "程序进入最终提交轮：本轮只提供 submit_diagnosis；也可以直接返回 JSON。"
@@ -118,7 +129,7 @@ class CounterfactualAgent:
                 self._emit("final_submission_round", {"round": round_no, "message": notice})
             elif checkpoint:
                 notice = {"role": "user", "content": json.dumps({
-                    "submit_checkpoint": "deadline" if stage1_force else "periodic",
+                    "submit_checkpoint": checkpoint_reason,
                     "round": round_no,
                     "rounds_remaining": self.max_rounds - round_no,
                     "state": self._stage_state(),
@@ -166,8 +177,7 @@ class CounterfactualAgent:
             turn.update(metadata)
             turn["assistant_message"] = deepcopy(message)
             usage = metadata.get("usage") or {}
-            if isinstance(usage.get("prompt_tokens"), int):
-                self.max_prompt_tokens = max(self.max_prompt_tokens, usage["prompt_tokens"])
+            self._record_usage(usage)
             self._emit("llm_response", {"round": round_no, **exchange["response"]})
             if metadata.get("finish_reason") == "length" and not (message.get("tool_calls") or []):
                 # A truncated JSON submission is unparseable; ask for a one-layer delta
@@ -325,6 +335,70 @@ class CounterfactualAgent:
     def _schemas(self, keep=None, stage=None):
         return self.registry.schemas(keep, self.stage if stage is None else stage)
 
+    def _reset_token_stats(self):
+        self.token_stats = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "uncached_prompt_tokens": 0,
+            "reasoning_tokens": 0, "usage_rounds": 0,
+        }
+        self.max_prompt_tokens = 0
+
+    def _record_usage(self, usage):
+        """Accumulate one response's usage; absent fields stay zero."""
+        usage = usage or {}
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        total = usage.get("total_tokens")
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        cached = cached if isinstance(cached, int) else 0
+        reasoning = reasoning if isinstance(reasoning, int) else 0
+        if isinstance(prompt, int):
+            self.token_stats["prompt_tokens"] += prompt
+            self.token_stats["cached_tokens"] += cached
+            self.token_stats["uncached_prompt_tokens"] += max(0, prompt - cached)
+            self.max_prompt_tokens = max(self.max_prompt_tokens, prompt)
+        if isinstance(completion, int):
+            self.token_stats["completion_tokens"] += completion
+        if reasoning:
+            self.token_stats["reasoning_tokens"] += reasoning
+        if isinstance(total, int):
+            self.token_stats["total_tokens"] += total
+        elif isinstance(prompt, int) and isinstance(completion, int):
+            self.token_stats["total_tokens"] += prompt + completion
+        if isinstance(prompt, int) or isinstance(completion, int) or isinstance(total, int):
+            self.token_stats["usage_rounds"] += 1
+
+    def token_summary(self):
+        history = getattr(self, "history", [])
+        rounds = len(history)
+        calls = sum(len(turn.get("tool_calls") or ()) for turn in history)
+        total = self.token_stats.get("total_tokens", 0)
+        usage_rounds = self.token_stats.get("usage_rounds", 0)
+        return {**self.token_stats,
+                "max_prompt_tokens": self.max_prompt_tokens,
+                "rounds": rounds,
+                "tool_calls": calls,
+                "tokens_per_round": round(total / usage_rounds) if usage_rounds else None,
+                "tokens_per_tool_call": round(total / calls) if calls else None}
+
+    def _stage1_checkpoint(self, round_no):
+        """Why Stage 1 should expose only submit_layer this round, if at all.
+
+        ``deadline`` fires near the round budget; ``periodic`` fires after
+        ``commit_every`` rounds without a Stage-1 commit.  Both require open
+        work, so a finished Stage 1 is not blocked.  This is the single
+        definition shared by the CoT and graph agents.
+        """
+        if self.stage != 1 or not worklist.required(self.assessments):
+            return None
+        if (self.max_rounds >= 8 and round_no >= self.max_rounds - 4
+                and self.last_commit_round < round_no - 1):
+            return "deadline"
+        if self.commit_every > 0 and round_no - self.last_commit_round >= self.commit_every:
+            return "periodic"
+        return None
+
     @staticmethod
     def _valid_message(message):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -369,10 +443,20 @@ class CounterfactualAgent:
             if (name in READERS and isinstance(result, dict)
                     and not result.get("duplicate_of")):
                 self.observations[name] = {"status": "loaded", **result}
+            self._sync_evidence_graph(name)
             return result
         finally:
             if name in READERS:
                 self.read_seconds += time.perf_counter() - started
+
+    def _sync_evidence_graph(self, name):
+        """Ingest records registered by the call just completed (read-only)."""
+        if self.evidence_graph is None or name == "read_evidence_graph":
+            return
+        added = self.evidence_graph.sync(self.registry.evidence, tool=name)
+        if added:
+            self.context_stats["evidence_graph_syncs"] += 1
+            self.context_stats["evidence_graph_observations"] += added
 
     @property
     def exposed_mechanisms(self):
@@ -442,7 +526,10 @@ class CounterfactualAgent:
                             "stage_two_round": self.stage_two_round,
                             "stage_one_commits": self.stage_one_commits,
                             "stage_one_committed": self.committed},
+                "token_usage": self.token_summary(),
                 "trajectory": self.history,
+                "evidence_graph": (self.evidence_graph.graph_summary()
+                                   if self.evidence_graph is not None else None),
                 "warnings": self.registry.sample.warnings,
                 "input_filter": deepcopy(background_policy(self.registry.sample).report()),
                 "timing": {"read_observations": self.read_seconds, "localize": time.perf_counter() - started,

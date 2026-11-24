@@ -1,5 +1,6 @@
 # MicroCEARCL 故障域规则注册表。
 # r1-r4 是 R 支持规则；cf1 是 CF 必要性签名；c1-c2 是对照规则。
+# type_signatures 只描述类型机制与典型现象；反例、边界和区分由 agent 推理。
 # 新增层级/类型只需修改本文件；程序不内置层名或规则文本。
 version: 1
 # 这些类型区分请求丢弃与响应丢弃，诊断时必须附 compare_presence 跨端对照。
@@ -7,7 +8,7 @@ boundary_types: [network_drop, response_drop]
 layers:
   - id: F0
     name: 基础设施与区域网络
-    types: [cross_zone_disconnect, cross_zone_packet_loss]
+    types: [cross_zone_disconnect]
     rules:
       r1: 跨 Zone 通信异常
       r2: 多个目标服务受影响（非必要）
@@ -16,6 +17,13 @@ layers:
       cf1: 若 F0 为根因，必须出现跨 Zone 异常或跨区调用失败
       c1: 同服务同任务跨区/同区对照
       c2: 匹配纯云/云边对照
+    type_signatures:
+      cross_zone_disconnect:
+        description: "跨 Zone（cloud↔edge）请求在请求阶段被整体丢弃；同区调用不受影响。"
+        phenomena:
+          - "跨区调用超时或连接重置，而同区调用正常。"
+          - "调用侧出现 ZONE_DEGRADE、CrossServiceUnavailableError 或 504；目标侧没有被丢弃请求的记录。"
+          - "切换 zone 偏好或改走本区实例后，同一目标恢复。"
   - id: F1
     name: 服务运行环境与服务入口边界
     types: [unavailable, slow, network_drop]
@@ -27,6 +35,25 @@ layers:
       cf1: 若 F1 为根因，必须出现 Agent 入口 503/504，或入口请求延迟抬升
       c1: 同服务不同调用方对照
       c2: 同调用方不同服务对照
+    type_signatures:
+      unavailable:
+        description: "服务入口持续返回 503，实例不可用。"
+        phenomena:
+          - "入口请求阶段 503 或调用方 504，错误体为 service_unavailable。"
+          - "目标实例没有正常处理记录；入口 success_rate 下降或为 0。"
+          - "多个调用方对同一入口失败，而其他服务正常。"
+      slow:
+        description: "入口处理延迟显著增加；请求仍到达目标并被执行。"
+        phenomena:
+          - "入口/服务处理延迟相对基线抬升（p50/p90/p99）。"
+          - "目标侧有请求与执行记录；success_rate 可保持，吞吐下降。"
+          - "调用方出现超时或重试，但请求已到达目标。"
+      network_drop:
+        description: "入口请求在请求阶段被丢弃，请求未到达目标。"
+        phenomena:
+          - "调用侧有请求/失败记录，目标侧没有对应请求或执行记录。"
+          - "失败发生在请求阶段，目标未执行。"
+          - "同一入口的其他调用可能成功；重试有时成功。"
   - id: F2
     name: 外部模型依赖
     types: [auth, quota]
@@ -38,6 +65,19 @@ layers:
       cf1: 若 F2 为根因，必须出现模型 endpoint 401 或 429
       c1: 不同 Agent 同模型对照
       c2: 调用/不调用模型任务对照
+    type_signatures:
+      auth:
+        description: "模型凭据失效，访问模型 endpoint 返回 401。"
+        phenomena:
+          - "模型 endpoint 返回 401、invalid_api_key 或 authentication error。"
+          - "多个 Agent 使用同一凭据时同时被拒。"
+          - "其他非模型端点正常。"
+      quota:
+        description: "模型配额耗尽，访问模型 endpoint 返回 429。"
+        phenomena:
+          - "模型 endpoint 返回 429、insufficient_quota 或 rate limit。"
+          - "多调用或突发后出现，恢复后可继续。"
+          - "没有 401。"
   - id: F3
     name: 接口交互与响应传递
     types: [missing_task_id, response_drop]
@@ -49,6 +89,19 @@ layers:
       cf1: 若 F3 为根因，必须出现 taskId 缺失，或上游已执行而调用方 response 阶段 504
       c1: 接收/执行/响应/接收阶段对照
       c2: 同服务正常/异常请求对照
+    type_signatures:
+      missing_task_id:
+        description: "跨服务请求的 taskId 被移除，契约字段缺失。"
+        phenomena:
+          - "请求参数或 query 中 taskId 缺失或为空串。"
+          - "下游报 task_id/subtaskId/flowid 为空，或 Missing required arguments: task, data。"
+          - "任务标识无法关联；错误日志因 task_id 为空而写入失败。"
+      response_drop:
+        description: "跨服务响应在响应阶段被丢弃；目标已执行，调用方收不到响应。"
+        phenomena:
+          - "目标侧有请求/执行记录，调用方无响应、超时或 504。"
+          - "目标可能已完成业务，但调用方 response 阶段失败。"
+          - "调用方重试可能导致目标重复执行。"
   - id: F4
     name: 执行控制与结果完整性
     types: [repeated_execution, truncated_result]
@@ -60,3 +113,16 @@ layers:
       cf1: 若 F4 为根因，必须出现重复模型响应或响应内容截断
       c1: 原始/接收模型响应对照
       c2: 响应/执行图精确关联
+    type_signatures:
+      repeated_execution:
+        description: "重放上一条 LLM 响应，导致同一 agent 步骤重复执行。"
+        phenomena:
+          - "同一 task/阶段出现重复的 LLM 响应、工具调用或执行步骤。"
+          - "重复内容相同且完整。"
+          - "不是 attempt 递增的正常重试。"
+      truncated_result:
+        description: "模型响应内容被截断，调用方收到不完整结果。"
+        phenomena:
+          - "模型访问成功，但响应内容或结果被截断、不完整。"
+          - "JSON/结构解析失败或字段缺失。"
+          - "调用方收到部分内容，后续解析或执行失败。"

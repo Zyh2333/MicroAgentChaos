@@ -10,7 +10,7 @@ CHECKS = ('check_layer',)
 SUBMITS = ('submit_layer',)
 DIAGNOSES = ('submit_diagnosis',)
 SUBMISSION_TOOLS = SUBMITS + DIAGNOSES
-EXTRA = ('read_evidence',)
+EXTRA = ('read_evidence', 'read_evidence_graph')
 LAYER_TO_TOOL = {layer: 'check_layer' for layer in LAYERS}
 MODULES = READERS + CHECKS + EXTRA + SUBMITS + DIAGNOSES
 # check_layer remains available internally (tests, dry runs) but the LLM-facing
@@ -47,6 +47,9 @@ class Registry:
                  if name not in SUBMISSION_TOOLS or name in allowed]
         if keep is not None:
             names = [name for name in names if name in keep]
+        # The graph tool only exists when the bridge is enabled for this run.
+        if getattr(self.agent, 'evidence_graph', None) is None:
+            names = [name for name in names if name != 'read_evidence_graph']
         return [{'type': 'function', 'function': {'name': name, 'description': module.DESCRIPTION,
             'parameters': {'type': 'object', 'properties': {**({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100}} if name in READERS else {}),
                 **getattr(module, 'PARAMETERS', {})}, 'additionalProperties': False}}}
@@ -58,8 +61,14 @@ class Registry:
         arguments = {} if arguments is None else arguments
         properties = {**({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100}} if name in READERS else {}),
                       **getattr(self.modules[name], 'PARAMETERS', {})}
-        if not isinstance(arguments, dict) or set(arguments) - set(properties):
-            raise ValueError('不支持的工具参数')
+        if not isinstance(arguments, dict):
+            raise ValueError('工具参数必须为 JSON object')
+        unknown = sorted(set(arguments) - set(properties))
+        if unknown:
+            # Name the offending keys: a bare "unsupported argument" leaves the
+            # model resending the same invented field.
+            raise ValueError(f'不支持的工具参数：{", ".join(unknown)}；'
+                             f'可用参数：{", ".join(sorted(properties)) or "（无）"}')
         for key, value in arguments.items():
             schema = properties[key]
             kind = schema['type']

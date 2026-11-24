@@ -8,12 +8,14 @@ from pathlib import Path
 import results_log
 from agent_rca import _service_rank
 from .agent import CounterfactualAgent
+from .graph_agent import CounterfactualGraphAgent
 from .evaluation import evaluate, projection
 from .io import ROOT, TOPOLOGY_MODES, FAULT_MODES, discover, load_sample, truth, write_json
 from .reporting import summarize, write_sublogs
 from .llm import ChatBackend, ReplayBackend
 from .rules import LAYERS
 from .utils.conversation_log import ConversationLog, error_info
+from .utils.graph_events import GraphEventLog
 from .utils.sample_mapping import sample_metadata, write_mapping
 from .utils.injection_hits import select as select_hit_samples
 from .utils import resume as resume_utils
@@ -61,10 +63,14 @@ def run_batch(args, backend_factory=None):
     backend = factory() if cases else None
     rows = []
     filter_tag = "csv_auth_masked" if args.mask_csv_gen_auth else "unmasked"
-    tag = args.tag or f"microcearcl_{args.backend}_{args.evidence_mode}_{filter_tag}_{output_dataset}"
+    tag = args.tag or (f"microcearcl_{args.backend}_{args.evidence_mode}_{filter_tag}_"
+                       f"{output_dataset}" + ("_graph" if getattr(args, "agent", "cot") == "graph"
+                                              else ""))
     headers = [f"MicroCloudEdgeAgentRootCauseLocalization root={root}",
-               f"backend={args.backend}; mode={args.evidence_mode}; targets=layer,fault_type",
+               f"backend={args.backend}; mode={args.evidence_mode}; "
+               f"agent={getattr(args, 'agent', 'cot')}; targets=layer,fault_type",
                f"mask_csv_gen_auth={args.mask_csv_gen_auth}",
+               f"evidence_graph={getattr(args, 'evidence_graph', False) or getattr(args, 'agent', 'cot') == 'graph'}",
                "Ground truth is used only after diagnosis; no service-rank metric."]
     if resume_info is not None:
         headers.append(f"resume={len(resume_info['mappings'])} mapping(s); "
@@ -102,13 +108,25 @@ def run_batch(args, backend_factory=None):
             identity = sample_metadata(case)
             artifact = mapping_path.parent / identity["artifact"]
             conversation = ConversationLog(artifact)
+            graph_events = GraphEventLog(artifact)
             result, error = {}, None
             try:
                 sample = load_sample(case.path, args.baseline, args.evidence_mode,
                     mask_csv_gen_auth=args.mask_csv_gen_auth, topology_file=getattr(args, 'topology_file', None))
                 read_seconds = time.perf_counter() - started
-                agent = CounterfactualAgent(backend, args.max_rounds, args.max_tool_calls,
-                                            commit_every=args.commit_every)
+                if getattr(args, "agent", "cot") == "graph":
+                    agent = CounterfactualGraphAgent(
+                        backend, args.max_rounds, args.max_tool_calls,
+                        degree_budget=getattr(args, "evidence_degree_budget", 6),
+                        commit_every=args.commit_every,
+                        graph_event_sink=graph_events.write)
+                else:
+                    agent = CounterfactualAgent(
+                        backend, args.max_rounds, args.max_tool_calls,
+                        commit_every=args.commit_every,
+                        evidence_graph=getattr(args, "evidence_graph", False),
+                        evidence_degree_budget=getattr(args, "evidence_degree_budget", 6),
+                        graph_event_sink=graph_events.write)
                 def checkpoint(value):
                     write_json(artifact, {**value, "sample_metadata": identity, "sample_mapping": mapping_relative})
                     last = next(iter(value.get("trajectory", [])[-1:]), {})
@@ -162,6 +180,7 @@ def run_batch(args, backend_factory=None):
                    "commit_every": args.commit_every,
                    "submit_checkpoints": (result.get("context") or {}).get("submit_checkpoints", 0),
                    "context_max_prompt_tokens": (result.get("context") or {}).get("max_prompt_tokens"),
+                   "token_usage": result.get("token_usage") or {},
                    "truncations": (result.get("context") or {}).get("truncations", 0),
                    "layer_order": layer_order, "fault_order": fault_order,
                    "layer_rank": best_rank(layer_order, gt_layers), "fault_rank": best_rank(fault_order, gt_types),
@@ -171,12 +190,16 @@ def run_batch(args, backend_factory=None):
                    "timing": {"read": read_seconds, **result.get("timing", {}), "total": time.perf_counter() - started},
                    "artifact": str(artifact.relative_to(out)),
                    "conversation_jsonl": str(conversation.jsonl_path.relative_to(out)),
-                   "conversation_log": str(conversation.text_path.relative_to(out))}
+                   "conversation_log": str(conversation.text_path.relative_to(out)),
+                   "graph_events_log": (str(graph_events.path.relative_to(out))
+                                        if graph_events.path.is_file() else None)}
             write_json(artifact, {**result, "sample_metadata": identity, "sample_mapping": mapping_relative, "evaluation": row})
             rows.append(row)
             save_results()
+            tokens = (row.get("token_usage") or {}).get("total_tokens")
             print(f"[eval] layer rank={row['layer_rank']} fault-type rank={row['fault_rank']} "
-                  f"retained={row['candidate_layers']} termination={row['termination']}")
+                  f"retained={row['candidate_layers']} tokens={tokens} "
+                  f"termination={row['termination']}")
         categories = sorted({r["category"] for r in rows})
         for dimension in ("layers", "types"):
             summarize(tag + "_" + dimension, projection(rows, dimension), categories=categories)
@@ -207,6 +230,8 @@ def parser():
     ap.add_argument('--skip-unhit-samples', action=argparse.BooleanOptionalAction, default=True,
                     help='默认跳过注入命中为 0 或缺少命中计数的 sample；单独记录且不计入准确率')
     ap.add_argument("--backend", choices=("llm", "replay"), default="llm")
+    ap.add_argument("--agent", choices=("cot", "graph"), default="cot",
+                    help="cot=原 CoT baseline（默认）；graph=图结构引导的新主循环")
     ap.add_argument("--replay", help="离线回放 JSON；仅验证管线，不报告为真实 LLM 结果")
     ap.add_argument("--model")
     ap.add_argument("--base-url")
@@ -217,6 +242,10 @@ def parser():
     ap.add_argument("--commit-every", type=int, default=5,
                     help="连续 N 轮无 Stage-1 提交时强制一次 submit 检查点；0 关闭周期检查点")
     ap.add_argument("--evidence-mode", choices=("runtime",), default="runtime")
+    ap.add_argument("--evidence-graph", action=argparse.BooleanOptionalAction, default=False,
+                    help="只读证据图：额外暴露 read_evidence_graph 工具与对应提示词；不改变诊断协议")
+    ap.add_argument("--evidence-degree-budget", type=int, default=6,
+                    help="证据图中每个观测允许的最大 DEPENDENT 度数；超出降级为 UNKNOWN")
     ap.add_argument("--mask-csv-gen-auth", action=argparse.BooleanOptionalAction, default=True,
                     help="保留已知 csv-gen 数据污染屏蔽；不作为通用诊断分类规则")
     ap.add_argument("--tag")
