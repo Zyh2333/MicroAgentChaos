@@ -75,7 +75,7 @@ def fault_modes(runtime: dict) -> list[str]:
     return [value] if value else list(FAULT_MODES)
 
 
-def faults_for_service(folder: str, service: str, runtime: dict) -> list[str]:
+def faults_for_service(folder: str, service: str, runtime: dict, topology_mode: str) -> list[str]:
     if runtime.get("INJECT_FAULT", "true").lower() in {"false", "0", "no", "off"}:
         return ["normal"]
     raw = runtime.get("FAULT_TYPES")
@@ -92,6 +92,8 @@ def faults_for_service(folder: str, service: str, runtime: dict) -> list[str]:
         not re.fullmatch(r"f[0-4]_[a-z0-9_]+", item) for item in faults
     ):
         raise ValueError("FAULT_TYPES must contain distinct valid fault names")
+    if service == "common" and topology_mode == "cloud-preference":
+        return [fault for fault in faults if fault != "f0_cross_zone_disconnect"]
     return faults
 
 
@@ -333,7 +335,7 @@ def run(plan: dict, run_dir: Path, selected_modes: list[str], selected_services:
             indices = entry["indices"]
             wrapper = HERE / folder / f"sum_chaos_cloud_{service}.sh"
             zone = "edge" if mode == "edge-preference" else "cloud" if mode == "cloud-preference" else plan["dynamic_fault_zone"]
-            for fault in faults_for_service(folder, service, runtime):
+            for fault in faults_for_service(folder, service, runtime, mode):
                 for persistence in fault_modes(runtime) if injecting else ["normal"]:
                     previous = completed.get(mode, {}).get(service, {}).get(fault, {}).get(persistence, 0)
                     remaining = target_count - previous
@@ -442,7 +444,7 @@ def main() -> int:
         run_id += f"-{secrets.token_hex(4)}"
         run_dir = (args.run_dir or DATA_ROOT / FOLDERS[args.folder] /
                    "agent_faults" / "topology_runs" / run_id).resolve()
-        task_count = int(os.environ.get("TASK_SAMPLE_COUNT", "1"))
+        task_count = int(os.environ.get("TASK_SAMPLE_COUNT", "10"))
         plan = create_selection(args.folder, args.service, task_count, run_dir)
         selected_services = plan["services"]
         runtime = plan["runtime_env"]

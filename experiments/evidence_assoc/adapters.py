@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from .extract import observation, vocabulary_from_messages
+from .hypothesis import proposition_claims
 from .propositions import (BOUNDARY, CF, CONTRADICTION, CONTROL, CORROBORATION,
                            DIAGNOSIS, SUPPORT, Claim)
 from .schema import Observation
@@ -130,7 +131,8 @@ def claims_from_artifact(artifact, graph):
     """Project the baseline's own assertions onto the graph's observation ids."""
     layer_claims, unknown = claims_from_layers(artifact.get("layers") or {}, graph)
     diagnosis_claims, missing = claims_from_diagnosis(artifact.get("diagnosis"), graph)
-    return layer_claims + diagnosis_claims, unknown + missing
+    promoted = proposition_claims((artifact.get("evidence_graph") or {}).get("proposition_evidence", {}))
+    return layer_claims + diagnosis_claims + promoted, unknown + missing
 
 
 # ------------------------------------------------------------- topology index

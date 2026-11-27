@@ -388,7 +388,7 @@ class CounterfactualAgent:
         ``deadline`` fires near the round budget; ``periodic`` fires after
         ``commit_every`` rounds without a Stage-1 commit.  Both require open
         work, so a finished Stage 1 is not blocked.  This is the single
-        definition shared by the CoT and graph agents.
+        definition shared by the ReAct and graph agents.
         """
         if self.stage != 1 or not worklist.required(self.assessments):
             return None

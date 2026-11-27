@@ -17,6 +17,7 @@ from experiments.evidence_assoc.adapters import (TopologyIndex, claims_from_diag
                                                  claims_from_layers, observations_from_evidence,
                                                  service_graph_from_sample)
 from experiments.evidence_assoc.associate import Associator
+from experiments.evidence_assoc.hypothesis import proposition_claims
 from experiments.evidence_assoc.propositions import assess, query_needs
 from experiments.evidence_assoc.relation import Policy
 
@@ -125,6 +126,8 @@ class EvidenceGraphBridge:
         graph = self.associator.graph
         claims, _ = claims_from_layers(layers or {}, graph)
         extra, _ = claims_from_diagnosis(diagnosis, graph)
+        if graph.hypothesis_memory is not None:
+            extra.extend(proposition_claims(graph.hypothesis_memory.proposition_evidence))
         return assess(graph, claims + extra)
 
     def summary(self):
@@ -159,6 +162,9 @@ class EvidenceGraphBridge:
     def graph_summary(self):
         """Compact summary safe to store in every artifact checkpoint."""
         summary = self.summary()
+        memory = self.associator.graph.hypothesis_memory
+        if memory is not None:
+            summary.update(memory.snapshot())
         summary["largest_components"] = [
             {"size": component["size"], "members": component["members"][:8]}
             for component in self.components(5)]

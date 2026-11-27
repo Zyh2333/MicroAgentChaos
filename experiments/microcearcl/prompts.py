@@ -115,3 +115,21 @@ GRAPH_CONTRIBUTION_SYSTEM = _compose(GRAPH_STATE_SECTION + """
 - related 是与该命题的引用同包的关联记录，用于查看执行链。
 - independent 是可用于核对该命题的独立观测。""")
 SYSTEM_WITH_EVIDENCE_GRAPH = _compose(EVIDENCE_GRAPH_SECTION)
+
+
+HYPOTHESIS_SECTION = """假设用于跨轮保留对当前观测的待验证解释，并引导后续查询寻找能区分不同故障类型的证据。
+在取证与提交中，用可选 hypotheses 数组保存基于已读观测的具体推断。
+新建项填写 statement（对象和待核实的陈述）、evidence_ids（原始记录 ID）和 propositions
+（规则 ID，如 F1-R1，或 层:类型，如 F1:slow）。不同解释分开记录，也可共同支持同一规则。
+新建时省略 id。更新时用已有 id 追加 evidence_ids，可省略 statement。
+role=basis 用于追加依据。已读记录及其关联能直接证实或反驳原陈述时用 role=confirms 或 refutes，
+证据可早于假设提出。覆盖不足时保留待验证。hypothesis_errors 列出需要修正的更新。
+确认后，所有证据边转接到该假设支持的每个命题，假设节点随即删除，后续通过命题查看和使用这些证据。
+graph.hypotheses.pairs 按重叠率从高到低排列。
+- ids 给出两个待验证假设的 ID，可在 graph.hypotheses.nodes 中查到各自的陈述。
+- intersection 是两个假设子图共有的节点数与共有的边数之和。
+- union 是两个子图合并去重后的节点数与边数之和。
+- overlap 等于 intersection / union，衡量两个子图的结构重叠程度，仅用于引导取证。
+- shared_evidence 列出双方共有的证据 ID，含经所支持命题引用的证据，等价观测合并后最多列 4 个。
+- unique_evidence 按假设 ID 列出各自子图独有的证据 ID，每侧最多 4 个。
+对照共有与独有证据，选择能区分两种解释的查询。"""

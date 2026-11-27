@@ -1,6 +1,6 @@
 """State-driven graph agent.
 
-The CoT baseline ``CounterfactualAgent`` decides what to read from the transcript.
+The ReAct baseline ``CounterfactualAgent`` decides what to read from the transcript.
 This agent pushes the evidence graph's semantic state into every round:
 
 * each open proposition carries the records it cites -- content, producer, time
@@ -15,7 +15,7 @@ This agent pushes the evidence graph's semantic state into every round:
 
 The model keeps the part it is uniquely good at: deciding what a record means and
 which rule it supports.  Stage 2 keeps the baseline protocol untouched.  The pull
-tool ``read_evidence_graph`` belongs to the CoT ablation.
+tool ``read_evidence_graph`` belongs to the ReAct ablation.
 """
 import hashlib
 import json
@@ -23,16 +23,18 @@ import time
 from copy import deepcopy
 
 from experiments.evidence_assoc import planner as graph_planner
-from experiments.evidence_assoc.adapters import claims_from_layers, expand_ids
+from experiments.evidence_assoc.hypothesis import HypothesisMemory, proposition_claims
+from experiments.evidence_assoc.adapters import claims_from_diagnosis, claims_from_layers, expand_ids
 from experiments.evidence_assoc.evolution import (DEFAULT_COMBINATION_SIZE,
                                                    DEFAULT_MAX_COMBINATIONS, ActivityLedger)
-from experiments.evidence_assoc.propositions import assess
+from experiments.evidence_assoc.propositions import SUPPORT, assess
 from experiments.evidence_assoc.view import graph_state, summary
 
 from .agent import CounterfactualAgent, _frame
-from .prompts import GRAPH_CONTRIBUTION_SYSTEM, GRAPH_SYSTEM
+from .prompts import GRAPH_CONTRIBUTION_SYSTEM, GRAPH_SYSTEM, HYPOTHESIS_SECTION
 from .registry import DIAGNOSES, READERS, SUBMITS, Registry
-from .rules import LAYERS, counterfactuals, controls as layer_controls, rule_lookup
+from .rules import LAYERS, TYPES, counterfactuals, controls as layer_controls, rule_lookup
+from .utils import state_budget as graph_budget
 from .utils import worklist
 from .utils.background_noise import POLICY, policy as background_policy
 from .utils.conversation_log import error_info, timestamp
@@ -49,13 +51,18 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                  commit_every=5, graph_event_sink=None, state_view="semantic",
                  state_budget=12000, project_transcript=False, context_budget=24000,
                  m2_combination_size=DEFAULT_COMBINATION_SIZE,
-                 m2_max_combinations=DEFAULT_MAX_COMBINATIONS):
+                 m2_max_combinations=DEFAULT_MAX_COMBINATIONS, m3=False):
         super().__init__(backend, max_rounds=max_rounds, max_tool_calls=max_tool_calls,
                          commit_every=commit_every, evidence_graph=True,
                          evidence_degree_budget=degree_budget,
                          graph_event_sink=graph_event_sink)
         self.prompt = GRAPH_CONTRIBUTION_SYSTEM if state_view == "contribution" else GRAPH_SYSTEM
+        self.m3 = m3
+        if m3:
+            self.prompt += "\n\n" + HYPOTHESIS_SECTION
         self.state_view = state_view
+        if state_budget < 2:
+            raise ValueError("--state-budget 至少为 2 个字符")
         self.state_budget = state_budget
         self.m2_combination_size = m2_combination_size
         self.m2_max_combinations = m2_max_combinations
@@ -72,6 +79,16 @@ class CounterfactualGraphAgent(CounterfactualAgent):
     def _schemas(self, keep=None, stage=None):
         """B2 pushes the semantic state; the pull tool belongs to the B1 ablation."""
         schemas = super()._schemas(keep=keep, stage=stage)
+        if self.m3:
+            for schema in schemas:
+                properties = schema["function"]["parameters"]["properties"]
+                properties["hypotheses"] = {"type": "array", "items": {
+                    "type": "object", "properties": {
+                        "id": {"type": "string"}, "statement": {"type": "string"},
+                        "propositions": {"type": "array", "items": {"type": "string"}},
+                        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                        "role": {"type": "string", "enum": ["basis", "confirms", "refutes"]}},
+                    "required": ["evidence_ids"], "additionalProperties": False}}
         return [schema for schema in schemas
                 if schema["function"]["name"] != "read_evidence_graph"]
 
@@ -83,16 +100,38 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                        if (record or {}).get("state") not in
                        worklist.NONBLOCKING_STATES}
         claims, _ = claims_from_layers(open_layers, graph)
+        promoted = proposition_claims(graph.hypothesis_memory.proposition_evidence) if self.m3 else []
+        claims.extend(c for c in promoted if c.layer not in self.assessments or c.layer in open_layers)
         propositions = assess(graph, claims)
         cf_rules = {layer: list(counterfactuals(layer)) for layer in LAYERS}
         control_rules = {layer: list(layer_controls(layer)) for layer in LAYERS}
         ranked = self.activity.ranked_propositions(
             propositions, rule_text=rule_lookup(), cf_rules=cf_rules,
             control_rules=control_rules)
+        memory_view = {}
+        protected = set()
+        budget = self.state_budget
+        if self.m3 and graph.hypothesis_memory.nodes:
+            all_claims, _ = claims_from_layers(self.assessments, graph)
+            all_claims = [c for c in all_claims if c.kind != SUPPORT or
+                          self.assessments[c.layer].get("state") != "excluded"]
+            diagnosis_claims, _ = claims_from_diagnosis(self.final, graph)
+            memory_claims = all_claims + diagnosis_claims
+            pending_rules = set()
+            for node in graph.hypothesis_memory.nodes.values():
+                if node["status"] == "pending":
+                    pending_rules.update(node["supports"])
+                    protected.update(e["id"] for e in node["evidence"])
+            for claim in memory_claims + promoted:
+                if claim.rule_id in pending_rules:
+                    protected.update(claim.evidence_ids)
+                    protected.update(claim.control_ids)
+            memory_view = graph.hypothesis_memory.view(graph, memory_claims, budget)
         selection = None
         if self.state_view == "contribution":
             selection = self.activity.select(
-                ranked, graph, budget=self.state_budget,
+                ranked, graph, budget=budget,
+                hypotheses=({"involved_nodes": protected},) if protected else (),
                 combination_size=self.m2_combination_size,
                 max_combinations=self.m2_max_combinations)
         state = graph_state(
@@ -101,15 +140,19 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             cf_rules=cf_rules, control_rules=control_rules,
             selection=selection, include_ids=True)
         state["state_view"] = self.state_view
-        state["activity"] = self.activity.refresh(
-            state, graph, propositions=ranked, selection=selection, round_no=round_no)
+        state = graph_budget.pack_state(state, memory_view, budget)
+        activity = self.activity.refresh(
+            state, graph, propositions=ranked, selection=selection, round_no=round_no,
+            protected_ids=protected)
+        graph_budget.finish_activity(state, activity, budget)
+        self.activity.activity_log[-1].update(budget=budget, spent=json_size(state))
         return state
 
     def _graph_fingerprint(self):
         graph = self._graph()
         return (len(graph.observations), len(graph.edges),
                 sum(len(bundles) for bundles in graph.support.values()),
-                len(graph.retracted), len(graph.retracted_support))
+                len(graph.retracted), len(graph.retracted_support), self._memory_revision)
 
     def _state_signature(self):
         signature = {}
@@ -147,7 +190,73 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                                         "state": record.get("state"), **support})
         return support
 
+    def _prepare_memory(self, payload, assessments=()):
+        if not self.m3 or not isinstance(payload, dict):
+            return None, []
+        updates = payload.get("hypotheses", [])
+        if "hypotheses" not in payload:
+            # Capture existing submit_layer.hypothesis without a second model action.
+            for item in assessments:
+                if not isinstance(item, dict) or not isinstance(item.get("hypothesis"), str):
+                    continue
+                support = [row for row in item.get("support") or () if isinstance(row, dict)]
+                ids, missing = self._resolve([row.get("evidence_id") for row in support])
+                rules = [row.get("rule_id") for row in support]
+                if ids and not missing and item["hypothesis"].strip() and all(r in self._m3_rules for r in rules):
+                    updates.append({"statement": item["hypothesis"], "propositions": rules,
+                                    "evidence_ids": ids})
+        if updates == []:
+            return None, []
+        graph = self._graph()
+        return graph.hypothesis_memory.revised(
+            updates, graph, self._m3_rules, self.round_no)
+
+    def _commit_memory(self, nodes):
+        if nodes is None:
+            return {}
+        graph = self._graph()
+        memory = graph.hypothesis_memory
+        changed = memory.commit(nodes)
+        if not changed:
+            return {}
+        affected_rules = set()
+        for node in changed.values():
+            event = {"type": "hypothesis", "node": deepcopy(node)}
+            if node["status"] == "confirmed":
+                event["op"] = "contract"
+                affected_rules.update(node["supports"])
+            self.evidence_graph.record(event)
+        edges = {rule: memory.proposition_evidence[rule] for rule in sorted(affected_rules)}
+        for claim in proposition_claims(edges):
+            if claim.kind == SUPPORT:
+                graph.claim(claim.rule_id, claim.evidence_ids)
+        self._memory_revision += 1
+        return changed
+
+    def _memory_feedback(self, result, nodes, errors):
+        if not result.get("error") and result.get("committed", True):
+            changed = self._commit_memory(nodes)
+            if changed:
+                result = {**result, "updated_hypotheses": list(changed)}
+                contracted = {key: list(node["supports"]) for key, node in changed.items()
+                              if node["status"] == "confirmed"}
+                if contracted:
+                    result["contracted_hypotheses"] = contracted
+        if errors:
+            result = {**result, "hypothesis_errors": errors}
+        return result
+
     def _dispatch(self, name, args, allowed=None):
+        if not self.m3 or not isinstance(args, dict):
+            return self._dispatch_graph(name, args, allowed)
+        if self.final is not None or (allowed is not None and name not in allowed):
+            raise ValueError("当前阶段或检查点不能执行此调用")
+        nodes, errors = self._prepare_memory(args, [args] if name == "submit_layer" else ())
+        clean_args = {k: v for k, v in args.items() if k != "hypotheses"}
+        result = self._dispatch_graph(name, clean_args, allowed)
+        return self._memory_feedback(result, nodes, errors)
+
+    def _dispatch_graph(self, name, args, allowed=None):
         if self.evidence_graph is not None:
             self.evidence_graph.begin_tool(name)
         if self.stage == 1 and name in READERS:
@@ -286,6 +395,11 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             sample, degree_budget=self.evidence_degree_budget,
             event_sink=self.graph_event_sink,
             context=lambda: (self.round_no, self.stage))
+        self._memory_revision = 0
+        if self.m3:
+            self._graph().hypothesis_memory = HypothesisMemory()
+            self._m3_rules = set(rule_lookup()) | {f"{layer}:{kind}" for layer, kinds in TYPES.items()
+                                                    for kind in kinds}
         self.ledger = graph_planner.QueryLedger()
         self.activity = ActivityLedger()
         self.projection_log = []
@@ -308,8 +422,8 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                               "max_rounds": self.max_rounds, "max_tool_calls": self.max_tool_calls,
                               "commit_every": self.commit_every,
                               "state_view": self.state_view,
-                              "state_budget": self.state_budget,
-                              "project_transcript": self.project_transcript,
+                              "state_budget": self.state_budget, "state_budget_policy": graph_budget.POLICY,
+                              "project_transcript": self.project_transcript, "m3": self.m3,
                               "context_budget": self.context_budget,
                               "prompt_sha256": hashlib.sha256(self.prompt.encode()).hexdigest()}
         if self.state_view == "contribution":
@@ -345,11 +459,11 @@ class CounterfactualGraphAgent(CounterfactualAgent):
             state = self._state(round_no)
             self.last_state = state
             self.state_log.append({"round": round_no, "stage": self.stage, "state": state})
-            activity = state.get("activity") or {}
+            activity = self.activity.activity_log[-1]
             self.context_stats["active_evidence"] = activity.get("active", 0)
             self.context_stats["dormant_evidence"] = activity.get("dormant", 0)
             self.context_stats["archived_evidence"] = activity.get("archived", 0)
-            self.context_stats["reactivated"] += len(activity.get("reactivated") or ())
+            self.context_stats["reactivated"] = len(self.activity.reactivation_log)
             if self.stage == 1:
                 checkpoint_reason = self._stage1_checkpoint(round_no)
                 if checkpoint_reason:
@@ -482,7 +596,12 @@ class CounterfactualGraphAgent(CounterfactualAgent):
                                 parsed.get("layer_order"), list):
                             self.last_stage_two = deepcopy(parsed)
                         submitted_stage = self.stage
+                        assessments = parsed.get("assessments", ()) if isinstance(parsed, dict) else ()
+                        nodes, errors = self._prepare_memory(parsed, assessments or ())
                         update = process_response(self, parsed)
+                        if self.m3:
+                            self.evidence_graph.begin_tool("stage_json")
+                            update = self._memory_feedback(update, nodes, errors)
                         self.committed = True
                         if submitted_stage == 1:
                             self.stage_one_commits += 1

@@ -64,6 +64,13 @@ def _state_ids(state, graph):
         found.add(row.get("id"))
     for row in overview.get("error_signals") or ():
         found.add(row.get("id"))
+    memory = state.get("hypotheses") or {}
+    for node in memory.get("nodes", {}).values():
+        found.update(node["evidence_ids"])
+    for pair in memory.get("pairs", ()):
+        found.update(pair["shared_evidence"])
+        for ids in pair["unique_evidence"].values():
+            found.update(ids)
     found.discard(None)
     return {item for item in found if item in graph.observations}
 
@@ -79,17 +86,24 @@ def _decision_test(propositions, graph):
     by_layer = defaultdict(list)
     for p in propositions:
         by_layer[p.layer].extend(p.claims)
-    baseline = {layer: _decision_signature(assess(graph, claims))
+    # The graph is fixed for one ``select`` call, so independence verdicts can
+    # be memoized: every removal combination re-asks the same evidence pairs,
+    # and ``semantic`` dominates the cost of ``assess``.
+    @lru_cache(maxsize=None)
+    def indep(a, b):
+        return graph.independent(a, b)
+
+    baseline = {layer: _decision_signature(assess(graph, claims, indep))
                 for layer, claims in by_layer.items()}
     references = {layer: {i for claim in claims for i in claim.evidence_ids + claim.control_ids}
                   for layer, claims in by_layer.items()}
 
-    @lru_cache(maxsize=4096)
+    @lru_cache(maxsize=None)
     def layer_changed(layer, removed):
         filtered = [replace(claim, evidence_ids=[i for i in claim.evidence_ids if i not in removed],
                             control_ids=[i for i in claim.control_ids if i not in removed])
                     for claim in by_layer[layer]]
-        states, vetoes = _decision_signature(assess(graph, filtered))
+        states, vetoes = _decision_signature(assess(graph, filtered, indep))
         old_states, old_vetoes = baseline[layer]
         return states != old_states or bool(old_vetoes - vetoes)
 
@@ -308,7 +322,7 @@ class ActivityLedger:
         return selection
 
     # ---------------------------------------------------------------- activity
-    def refresh(self, state, graph, propositions=None, selection=None, round_no=None):
+    def refresh(self, state, graph, propositions=None, selection=None, round_no=None, protected_ids=()):
         """Derive the four states from the rendered state and log transitions."""
         active = _state_ids(state, graph)
         if selection is not None:
@@ -317,7 +331,10 @@ class ActivityLedger:
             eligible = self.eligible(propositions, graph)
         else:
             eligible = list(self._eligible)
-        eligible = set(eligible) | active
+        protected = set(protected_ids)
+        if selection is not None:
+            protected.update(v for v, delta in selection.contributions.items() if delta[3])
+        eligible = set(eligible) | active | protected
         cited = {i for p in (propositions or ()) for i in p.evidence_ids}
         fresh_bundles = {graph.bundle_of(i) for i in self._fresh
                          if i in graph.observations}
@@ -344,14 +361,12 @@ class ActivityLedger:
         self._previous = states
         self.states = states
         self._fresh.clear()
-        protected = (sum(1 for delta in selection.contributions.values() if delta[3])
-                     if selection is not None else 0)
         summary = {
             "active": sum(1 for state in states.values() if state == ACTIVE),
             "dormant": sum(1 for state in states.values() if state == DORMANT),
             "archived": sum(1 for state in states.values() if state == ARCHIVED),
             "selected": len(active),
-            "protected": protected,
+            "protected": len(protected),
             "budget_chars": getattr(selection, "budget", None),
             "spent_chars": getattr(selection, "spent", None),
             "reactivated": events[:16],
@@ -361,7 +376,7 @@ class ActivityLedger:
             "mode": "contribution" if selection is not None else "semantic",
             "active": summary["active"], "dormant": summary["dormant"],
             "archived": summary["archived"], "selected": summary["selected"],
-            "protected": protected,
+            "protected": len(protected),
             "budget": summary["budget_chars"], "spent": summary["spent_chars"],
             "order": list(selection.order) if selection is not None else list(eligible),
             "contributions": ({v: list(delta) for v, delta in selection.contributions.items()}

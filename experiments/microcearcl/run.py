@@ -19,7 +19,9 @@ from .utils.conversation_log import ConversationLog, error_info
 from .utils.graph_events import GraphEventLog
 from .utils.sample_mapping import sample_metadata, write_mapping
 from .utils.injection_hits import select as select_hit_samples
+from .utils import state_budget as graph_budget
 from .utils import resume as resume_utils
+from .utils.resume_batch import ResumeBatch
 
 
 def best_rank(order, targets):
@@ -35,6 +37,22 @@ def run_batch(args, backend_factory=None):
         raise ValueError("没有可用的带标签 sample；检查 --root、--topology-modes 和 --fault-modes")
     cases, skipped = select_hit_samples(discovered, getattr(args, 'skip_unhit_samples', True))
     output_dataset = "MAR" if dataset == "MARBLEBench" else dataset
+    agent_name = getattr(args, "agent", "react")
+    graph_agent = agent_name == "graph"
+    m3 = getattr(args, "m3", False)
+    if m3 and not graph_agent:
+        raise ValueError("--m3 需要 --agent graph")
+    variant = {"agent": agent_name}
+    if graph_agent:
+        variant = {"agent": "graph", "state_view": getattr(args, "state_view", "semantic"),
+                   "project_transcript": getattr(args, "project_transcript", False), "m3": m3,
+                   "state_budget": getattr(args, "state_budget", 12000), "state_budget_policy": graph_budget.POLICY}
+    if graph_agent and variant["state_budget"] < 2:
+        raise ValueError("--state-budget 至少为 2 个字符")
+    resume_sources = getattr(args, 'resume_from', None)
+    resumed_batch = ResumeBatch(resume_sources, output_dataset) if resume_sources else None
+    if resumed_batch and resume_utils.batch_variant(resumed_batch.mapping_path, resumed_batch.mapping) != variant:
+        raise ValueError("续跑目标的 graph 消融配置不同，请为新配置创建独立批次")
     resume_info, resume_skipped = None, []
     if getattr(args, 'resume', False) or getattr(args, 'resume_from', None):
         resume_root = results_log.out_root(output_dataset, "MicroCEARCL")
@@ -42,7 +60,7 @@ def run_batch(args, backend_factory=None):
             output_dataset,
             output_root=resume_root if getattr(args, 'resume', False) else None,
             sources=getattr(args, 'resume_from', None),
-            only_success=getattr(args, 'resume_retry_failed', False))
+            only_success=getattr(args, 'resume_retry_failed', False), variant=variant)
         cases, resume_skipped = resume_utils.filter_cases(cases, root, output_dataset, index)
         resume_info = resume_utils.summary(index)
         print(f"Resume: {resume_info['executed_samples']} executed sample keys from "
@@ -51,7 +69,7 @@ def run_batch(args, backend_factory=None):
     if args.limit is not None:
         cases = cases[:args.limit]
     if not cases:
-        print("No samples remain after selection/resume; writing an empty batch record.",
+        print("No samples remain after selection/resume; refreshing the batch record.",
               flush=True)
     def factory():
         if backend_factory:
@@ -62,38 +80,65 @@ def run_batch(args, backend_factory=None):
     # One backend (and HTTP connection pool) serves the whole batch: a fresh client
     # per sample leaked sockets and memory across long runs.
     backend = factory() if cases else None
-    rows = []
+    rows = resumed_batch.rows if resumed_batch else []
     filter_tag = "csv_auth_masked" if args.mask_csv_gen_auth else "unmasked"
     tag = args.tag or (f"microcearcl_{args.backend}_{args.evidence_mode}_{filter_tag}_"
-                       f"{output_dataset}" + ("_graph" if getattr(args, "agent", "cot") == "graph"
-                                              else ""))
+                       f"{output_dataset}" + ("_graph" if graph_agent else ""))
+    if not args.tag and graph_agent:
+        tag += f"_{variant['state_view']}" + ("_zip" if variant["project_transcript"] else "") + ("_m3" if m3 else "")
+    if resumed_batch:
+        tag = resumed_batch.tag
     headers = [f"MicroCloudEdgeAgentRootCauseLocalization root={root}",
                f"backend={args.backend}; mode={args.evidence_mode}; "
-               f"agent={getattr(args, 'agent', 'cot')}; targets=layer,fault_type",
+               f"agent={agent_name}; targets=layer,fault_type",
                f"mask_csv_gen_auth={args.mask_csv_gen_auth}",
-               f"evidence_graph={getattr(args, 'evidence_graph', False) or getattr(args, 'agent', 'cot') == 'graph'}",
+               f"evidence_graph={getattr(args, 'evidence_graph', False) or graph_agent}",
                "Ground truth is used only after diagnosis; no service-rank metric."]
+    if graph_agent:
+        headers.append(f'graph_variant={variant}')
     if resume_info is not None:
         headers.append(f"resume={len(resume_info['mappings'])} mapping(s); "
                        f"skipped_executed={len(resume_skipped)}")
-    with contextlib.ExitStack() as cleanup, \
-            results_log.open_batch(output_dataset, "MicroCEARCL", tag, headers) as (out_root, ts):
+    output_context = (resumed_batch.open(headers) if resumed_batch else
+                      results_log.open_batch(output_dataset, "MicroCEARCL", tag, headers, reserve_sample_dir=True))
+    with contextlib.ExitStack() as cleanup, output_context as (out_root, ts):
         if backend is not None and hasattr(backend, "close"):
             cleanup.callback(backend.close)
         out = Path(out_root)
-        mapping_path = write_mapping(out / "samples" / ts, cases, dataset=output_dataset, tag=tag, data_root=root)
+        identities = ([resumed_batch.identity(case, root, output_dataset) for case in cases]
+                      if resumed_batch else [sample_metadata(case) for case in cases])
+        mapping_path = write_mapping(out / "samples" / ts, cases, dataset=output_dataset,
+                                     tag=tag, data_root=root, identities=identities if resumed_batch else None,
+                                     variant=variant)
         mapping_relative = str(mapping_path.relative_to(out))
+        mapped_samples = json.loads(mapping_path.read_text(encoding="utf-8"))["samples"]
+        row_order = {sid: i for i, sid in enumerate(mapped_samples)}
+        report_groups = {key for entry in mapped_samples.values()
+                         for key in ((entry["topology_mode"],),
+                                     (entry["topology_mode"], entry["fault_mode"]))}
         print(f"Sample mapping: {mapping_path}")
         selection = {'discovered': len(discovered), 'selected': len(cases), 'skipped': len(skipped),
                      'limit': args.limit, 'skip_unhit_samples': getattr(args, 'skip_unhit_samples', True),
                      'resume': resume_info, 'resume_skipped': len(resume_skipped)}
+        if resumed_batch:
+            selection, skipped = resumed_batch.selection(selection, skipped)
         write_json(out / f'selection-{tag}_{ts}.json',
                    {'selection': selection, 'skipped_samples': skipped,
                     'resume_skipped': resume_skipped})
         def save_results():
-            write_json(out / f"results-{tag}_{ts}.json", {'sample_mapping': mapping_relative,
+            rows.sort(key=lambda row: row_order.get(row.get("sample_id"), len(row_order)))
+            metrics = evaluate(rows)
+            write_json(out / f"results-{tag}_{ts}.json", {
+                **(resumed_batch.payload if resumed_batch else {}), 'sample_mapping': mapping_relative,
                 'selection': selection, 'skipped_samples': skipped, 'resume_skipped': resume_skipped,
-                'rows': rows, 'metrics': evaluate(rows)})
+                'rows': rows, 'metrics': metrics})
+            write_json(out / f"metrics-{tag}_{ts}.json", metrics)
+            if resumed_batch:
+                categories = sorted({r["category"] for r in rows})
+                for dimension in ("layers", "types"):
+                    write_sublogs(out, ts, tag + "_" + dimension,
+                                  projection(rows, dimension), categories=categories,
+                                  groups=report_groups)
         save_results()
         print(f"Found {len(discovered)} labeled samples; selected={len(cases)}, "
               f"skipped={len(skipped)}, resume_skipped={len(resume_skipped)}.")
@@ -101,13 +146,16 @@ def run_batch(args, backend_factory=None):
             print(f"[skip] {item['case']}: {item['reason']}")
         for item in resume_skipped:
             print(f"[resume-skip] {item['case']}: {item['reason']}")
-        for case in cases:
+        for case, identity in zip(cases, identities):
             gt_layers, gt_types = truth(case.label)
             results_log.sample_banner(f"{case.topology_mode}/{case.fault_mode}", case.name,
                                       ",".join(gt_layers), case.label.get("fault_type", ""))
             started = time.perf_counter()
-            identity = sample_metadata(case)
             artifact = mapping_path.parent / identity["artifact"]
+            if resumed_batch:
+                resumed_batch.reset_sample(identity)
+                rows[:] = [row for row in rows if row.get("sample_id") != identity["sample_id"]]
+                save_results()
             conversation = ConversationLog(artifact)
             graph_events = GraphEventLog(artifact)
             result, error = {}, None
@@ -115,13 +163,13 @@ def run_batch(args, backend_factory=None):
                 sample = load_sample(case.path, args.baseline, args.evidence_mode,
                     mask_csv_gen_auth=args.mask_csv_gen_auth, topology_file=getattr(args, 'topology_file', None))
                 read_seconds = time.perf_counter() - started
-                if getattr(args, "agent", "cot") == "graph":
+                if graph_agent:
                     agent = CounterfactualGraphAgent(
                         backend, args.max_rounds, args.max_tool_calls,
                         degree_budget=getattr(args, "evidence_degree_budget", 6),
                         commit_every=args.commit_every,
                         graph_event_sink=graph_events.write,
-                        state_view=getattr(args, "state_view", "semantic"),
+                        state_view=getattr(args, "state_view", "semantic"), m3=m3,
                         state_budget=getattr(args, "state_budget", 12000),
                         project_transcript=getattr(args, "project_transcript", False),
                         context_budget=getattr(args, "context_budget", 24000),
@@ -172,7 +220,7 @@ def run_batch(args, backend_factory=None):
                    "true_layers": gt_layers, "true_types": gt_types,
                    "status": "success" if completed else "failed", "error": error,
                    "termination": result.get("termination", "input_error"),
-                   "backend": args.backend, "evidence_mode": args.evidence_mode,
+                   "backend": args.backend, "evidence_mode": args.evidence_mode, **variant,
                    "mask_csv_gen_auth": args.mask_csv_gen_auth,
                    "topology_mode": case.topology_mode, "fault_mode": case.fault_mode,
                    "persistence": case.fault_mode,
@@ -236,7 +284,8 @@ def parser():
     ap.add_argument("--resume", action="store_true",
                     help="扫描当前 dataset 的历史 mapping.json，跳过已有终态结果的 sample")
     ap.add_argument("--resume-from", nargs="+",
-                    help="指定历史 mapping.json 或 samples/<ts> 目录（可多个）；--root/topology/fault 可不同")
+                    help="原地更新第一个指定批次的样本、日志和完整汇总；额外来源用于跳过已执行样本；"
+                         "--root/topology/fault 可不同")
     ap.add_argument("--resume-retry-failed", action="store_true",
                     help="resume 时只跳过成功样本，重跑失败/预算耗尽样本")
     ap.add_argument("--baseline", help="可选，同条件正常 sample，用于请求处理延迟对照")
@@ -244,8 +293,8 @@ def parser():
     ap.add_argument('--skip-unhit-samples', action=argparse.BooleanOptionalAction, default=True,
                     help='默认跳过注入命中为 0 或缺少命中计数的 sample；单独记录且不计入准确率')
     ap.add_argument("--backend", choices=("llm", "replay"), default="llm")
-    ap.add_argument("--agent", choices=("cot", "graph"), default="cot",
-                    help="cot=原 CoT baseline（默认）；graph=图结构引导的新主循环")
+    ap.add_argument("--agent", choices=("react", "graph"), default="react",
+                    help="react=ReAct 基线（默认）；graph=证据图引导的主循环")
     ap.add_argument("--replay", help="离线回放 JSON；仅验证管线，不报告为真实 LLM 结果")
     ap.add_argument("--model")
     ap.add_argument("--base-url")
@@ -264,13 +313,15 @@ def parser():
                     help="graph agent 的证据状态：semantic=固定上限语义视图；"
                          "contribution=按边际贡献字典序填充")
     ap.add_argument("--state-budget", type=int, default=12000,
-                    help="contribution 模式下每轮证据摘要的字符预算 B_t")
+                    help="每轮 graph 对象序列化后的总字符预算（证据、命题、活动状态、M3 假设共用）")
     ap.add_argument("--m2-combination-size", type=int, default=DEFAULT_COMBINATION_SIZE,
                     help="contribution 模式下每次反事实删除的证据数（默认 %(default)s）")
     ap.add_argument("--m2-max-combinations", type=int, default=DEFAULT_MAX_COMBINATIONS,
                     help="contribution 模式下每轮最多检验的组合数（默认 %(default)s）")
     ap.add_argument("--project-transcript", action=argparse.BooleanOptionalAction, default=False,
-                    help="实验选项，默认关闭；将历史工具结果折叠为证据引用，待 M3 假设验证接入后再评估")
+                    help="实验选项，默认关闭；将历史工具结果折叠为证据引用")
+    ap.add_argument("--m3", action=argparse.BooleanOptionalAction, default=False,
+                    help="graph agent 保存跨轮假设，并按含命题的子图重叠率引导取证")
     ap.add_argument("--context-budget", type=int, default=24000,
                     help="transcript 投影后的字符预算")
     ap.add_argument("--mask-csv-gen-auth", action=argparse.BooleanOptionalAction, default=True,
@@ -282,6 +333,8 @@ def parser():
 def main():
     ap = parser()
     args = ap.parse_args()
+    if args.m3 and args.agent != "graph":
+        ap.error("--m3 需要 --agent graph")
     if args.backend == "replay" and not args.replay:
         ap.error("--backend replay 需要 --replay")
     if any(v <= 0 for v in (args.max_rounds, args.max_tool_calls, args.timeout, args.max_tokens)):

@@ -97,8 +97,13 @@ def _unique(values):
     return out
 
 
-def assess(graph, claims):
-    """Turn flat claims into propositions with graph-derived strength."""
+def assess(graph, claims, indep=None):
+    """Turn flat claims into propositions with graph-derived strength.
+
+    ``indep`` optionally supplies a memoized ``graph.independent`` lookup; the
+    removal-combination search evaluates the same evidence pairs repeatedly.
+    """
+    lookup = indep or graph.independent
     grouped = {}
     order = []
     for claim in claims:
@@ -143,7 +148,7 @@ def assess(graph, claims):
         controls_known = [i for i in controls if i in all_ids]
         independent_control = None
         if known and controls_known:
-            independent_control = any(graph.independent(s, c) for s in known for c in controls_known)
+            independent_control = any(lookup(s, c) for s in known for c in controls_known)
 
         refutations = [claim for claim in group
                        if claim.kind == CF and (claim.state == "absent")]

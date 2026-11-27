@@ -146,16 +146,43 @@ def _mapping_paths(output_root=None, sources=None):
     return sorted({p.resolve() for p in paths})
 
 
-def load_index(dataset, output_root=None, sources=None, only_success=False):
+def batch_variant(path, payload):
+    if "agent_variant" in payload:
+        variant = payload["agent_variant"]
+        if isinstance(variant, dict) and variant.get("agent") == "cot":
+            return {**variant, "agent": "react"}
+        return variant
+    # Historical graph runs stored their settings in each sample artifact.
+    for entry in (payload.get("samples") or {}).values():
+        artifact = path.parent / str(entry.get("artifact") or "")
+        if artifact.is_file():
+            try:
+                config = json.loads(artifact.read_text(encoding="utf-8")).get("configuration") or {}
+            except (OSError, ValueError):
+                continue
+            if config.get("agent") == "graph" or "state_view" in config:
+                budget = {k: config[k] for k in ("state_budget", "state_budget_policy")
+                          if "state_budget_policy" in config and k in config}
+                return {**budget, "agent": "graph", "state_view": config.get("state_view", "semantic"),
+                        "project_transcript": config.get("project_transcript", False),
+                        "m3": config.get("m3", False)}
+            if config:
+                break
+    return {"agent": "react"}
+
+
+def load_index(dataset, output_root=None, sources=None, only_success=False, variant=None):
     """Build the executed-sample index from mapping.json + results/artifacts."""
     index = ResumeIndex()
     paths = _mapping_paths(output_root=output_root, sources=sources)
-    index.mappings = [str(path) for path in paths]
     for path in paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise ValueError(f"无法读取 resume mapping: {path}: {exc}") from exc
+        if variant is not None and batch_variant(path, payload) != variant:
+            continue
+        index.mappings.append(str(path))
         batches = payload.get("batches") or [{}]
         entries = payload.get("samples") or {}
         rows = _result_rows(path)
@@ -167,13 +194,13 @@ def load_index(dataset, output_root=None, sources=None, only_success=False):
             batch = _batch_for(entry, batches)
             semantic = _semantic(entry, dataset)
             relative = _relative(entry, batch)
-            if sample_id in executed_ids:
-                index.add(semantic, (semantic[0], *semantic[1:4], relative)
-                          if relative else None, path)
-                continue
             artifact = path.parent / str(entry.get("artifact") or "")
-            if (entry.get("artifact") and artifact.is_file()
-                    and _terminal_artifact(artifact, only_success=only_success)):
+            # A newer in-place attempt can be pending/running while the last
+            # aggregate still contains the previous terminal row.
+            terminal = (_terminal_artifact(artifact, only_success=only_success)
+                        if entry.get("artifact") and artifact.is_file()
+                        else sample_id in executed_ids)
+            if terminal:
                 index.add(semantic, (semantic[0], *semantic[1:4], relative)
                           if relative else None, path)
         # Results can outlive a mapping edit; keep terminal rows that no longer

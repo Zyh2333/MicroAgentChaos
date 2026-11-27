@@ -78,6 +78,7 @@ class EvidenceGraph:
         # G2: written edges are retractable.  ``support`` is the E_S ledger
         # (proposition -> bundle root -> cited observations); ``retracted`` keeps
         # the audit trail of withdrawn evidence edges.
+        self.hypothesis_memory = None
         self.support = {}
         self.retracted = []
         self.retracted_support = []
@@ -512,8 +513,11 @@ class EvidenceGraph:
         }
 
     def to_dict(self, limit=200):
-        return {"summary": self.summary(), "classes": list(self.classes().values())[:limit],
+        data = {"summary": self.summary(), "classes": list(self.classes().values())[:limit],
                 "components": self.components()[:limit],
                 "edges": [edge.to_dict() for edge in list(self.edges.values())[:limit]],
                 "unknown_samples": self.unknown_samples[:50],
                 "observations": [o.to_dict() for o in list(self.observations.values())[:limit]]}
+        if self.hypothesis_memory is not None:
+            data.update(self.hypothesis_memory.snapshot())
+        return data

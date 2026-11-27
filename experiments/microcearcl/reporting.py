@@ -31,8 +31,8 @@ def summarize(tag, rows, categories=()):
             print(f'  mean {stage}: {sum(values)/len(values):.3f}s ({len(values)})')
 
 
-def write_sublogs(root, ts, tag, rows, categories=()):
-    subsets = {}
+def write_sublogs(root, ts, tag, rows, categories=(), groups=()):
+    subsets = {key: [] for key in groups}
     for row in rows:
         topology, fault_mode = row['topology_mode'], row['fault_mode']
         subsets.setdefault((topology,), []).append(row)
